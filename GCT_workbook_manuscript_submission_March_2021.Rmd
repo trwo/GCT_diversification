@@ -13,8 +13,6 @@ editor_options:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-This is the accompanying code to Oliver et al 2021, explaining how the bespoke variant filtering and analyses were done and how the manuscript's statistical analyses and plots were generated.
-
 If you have any queries or have identified potential errors, please email to3\\@sanger.ac.uk.
 
 #Bespoke DNA filtering and processing steps
