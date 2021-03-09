@@ -1,0 +1,2878 @@
+---
+  title: "Fetal origins of malignant germ cell tumours"
+author: "Thomas R W Oliver"
+output: 
+  html_document:
+  toc: true
+toc_depth: 2
+number_sections: true
+editor_options:
+  chunk_output_type: console
+---
+  ```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is the accompanying code to Oliver et al 2021, explaining how the bespoke variant filtering and analyses were done and how the manuscript's statistical analyses and plots were generated.
+
+If you have any queries or have identified potential errors, please email to3\\@sanger.ac.uk.
+
+#Bespoke DNA filtering and processing steps
+
+These were necessary to remove sequencing and mapping artefacts that passed the standard low input pipeline variant calling. Usually, these would be removed by fitting a beta-binomial distribution and assessing for overdispersion of VAFs across all samples taken from a patient. Here, because most cases only had a single matched normal and the remaining tumour samples shared many variants at similar VAFs, this approach would remove true variants.
+
+##Site specific error rate estimation
+
+Adapted from Coorens et al 2019.
+
+###SNV filtering
+
+```{r}
+
+#-------------------------------------------------
+# Libraries
+#-------------------------------------------------
+
+library("GenomicRanges")
+library("deepSNV")
+library("Rsamtools")
+
+logbb = deepSNV:::logbb
+dbetabinom = VGAM::dbetabinom
+
+#-------------------------------------------------
+# Functions
+#-------------------------------------------------
+
+estimateRho_gridml = function(x, mu) {
+  # Estimate rho by MLE grid approach
+  rhovec = 10^seq(-6,-0.5,by=0.05) # rho will be bounded within 1e-6 and 0.32
+  mm = x[,2]
+  cov = c(x[,1])
+  ll = sapply(rhovec, function(rhoj) sum(dbetabinom(x=mm, size=cov, rho=rhoj, prob=mu, log=T)))
+  rhovec[ll==max(ll)][1]
+}
+
+shearwater_probability=function(patient, save=NULL, path_prefix='', rho=10^-3){
+  #Function to calculate probability of presence of mutation based on Shearwarer
+  #'patient' is the name of the patient-specific subfolder
+  #'path_prefix' is any prefix to the path necessary to find that subfolder
+  #'rho' is the constant for the overdispersion parameter. If rho=NULL, calculate
+  # it from the data (much slower)
+  #'save' is path for output. If NULL, returns matrix
+  # output of this function will be a matrix (muts by samples) of p values
+  
+  
+  #A file of mutations in patient subdirectory (format: Chr_Ref_Pos_Alt)
+  Muts_patient = read.table(paste0(path_prefix,patient,"/All_mutations_filtered.txt"))[,1] 
+  #A file of with the sample names belonging to this patient
+  case_samples=read.table(paste0(path_prefix,patient,"/samples.txt"))[,1]
+  normal_panel = normal_samples
+  norm_all_counts = all_counts[normal_panel,,]
+  coords_proj = substr(Muts_patient,1,nchar(Muts_patient)-4)
+  case_all_counts = all_counts[case_samples,,]
+ 
+  avg_depth_list = c()
+  for (i in 1:length(coords_proj)){
+    mean_d = sum(case_all_counts[,i,]) / length(case_samples)
+    avg_depth_list = c(avg_depth_list, mean_d)
+  }
+  
+  Muts_patient = Muts_patient[avg_depth_list > 10] #Removes remaining globally low coverage variants which were the result of mapping issues
+  coords_proj = coords_proj[avg_depth_list > 10]
+
+  #Set up pval matrix
+  pval_mat = matrix(1,ncol=length(case_samples),nrow=length(Muts_patient))
+  rownames(pval_mat)=Muts_patient
+  colnames(pval_mat)=case_samples
+  
+  
+  Alt=substr(Muts_patient,nchar(Muts_patient),nchar(Muts_patient))
+  Ref=substr(Muts_patient,nchar(Muts_patient)-2,nchar(Muts_patient)-2)
+  
+  for (s in case_samples){
+    rho_est=rep(NA,length(coords_proj))
+    test_counts = all_counts[s,coords_proj,]
+    for (k in 1:length(coords_proj)) {
+      n = sum(test_counts[coords_proj[k],])
+      x = test_counts[coords_proj[k],Alt[k]]
+      
+      N_indiv = rowSums(norm_all_counts[,coords_proj[k],])
+      X_indiv = norm_all_counts[,coords_proj[k],c("A","C","G","T")!=Ref[k]]
+      pseudo = .Machine$double.eps    
+      N=sum(N_indiv)
+      X=sum(X_indiv)
+      
+      mu = max(X,pseudo)/max(N,pseudo)
+      counts = cbind(N,X)
+      if(is.null(rho)) rho = estimateRho_gridml(counts,mu)
+      rdisp = (1 - rho)/rho
+      
+      prob0 = (X + x)/(N + n); prob0[prob0==0] = pseudo; prob0[prob0==1] = 1 - pseudo
+      prob1s = x/(n + pseudo); prob1s[prob1s==0] = pseudo; prob1s[prob1s==1] = 1 - pseudo
+      prob1c = X/(N + pseudo); prob1c[prob1c==0] = pseudo; prob1c[prob1c==1] = 1 - pseudo
+      
+      prob1s = pmax(prob1s,prob1c) # Min error rate is that of the population (one-sided test)
+      nu0 = prob0 * rdisp; nu1s = prob1s * rdisp; nu1c = prob1c * rdisp; 
+      
+      # Likelihood-Ratio Tests
+      LL = logbb(x, n, nu0, rdisp) + logbb(X, N, nu0, rdisp) - logbb(x, n, nu1s, rdisp) - logbb(X, N, nu1c, rdisp)
+      pvals = pchisq(-2*LL, df=1, lower.tail=F)/2 # We divide by 2 as we are performing a 1-sided test
+      # Saving the result
+      pval_mat[k,s] = pvals
+    } 
+  }
+  if(is.null(save)){
+    return(pval_mat)
+  }else{
+    write.table(pval_mat,save)
+  }
+}
+
+#-------------------------------------------------
+# Input
+#-------------------------------------------------
+
+#setwd('/lustre/scratch117/casm/team294/to3/testes/tumour/allelecount/20200511')
+#options(stringsAsFactors = F)
+
+# Vector of normal reference samples, taken from a separate cohort of patients
+normal_samples = read.table("/lustre/scratch119/casm/team294rr/to3/testes/tumour/reference_datasets/reference_lcm_normal_panel.txt")[,1] 
+
+# Vector of all samples, including the reference panel and samples of interest
+tumour_samples = read.table("/lustre/scratch119/casm/team294rr/to3/testes/tumour/reference_datasets/gct_samples.txt")[,1]
+samples <- c(tumour_samples, normal_samples)
+
+# "Bed" file of all mutations to be considered (across all patients)
+# Format: Chr Ref Pos Alt
+muts = read.table("GCT_SSM.snvs.bed") 
+coords = paste(muts$V1, muts$V2, sep="_")
+
+# Read in data from AlleleCounter
+all_counts = array(0,dim=c(length(samples), length(coords), 4),
+                   dimnames = list(samples, coords, c("A","C","G","T")))
+
+print(length(samples)) #381 samples, 250 reference samples, 131 GCT genomes
+
+for (k in 1:length(samples)){
+  #Read in allele counts per sample
+  if(file.exists(paste0("output/", samples[k],".txt"))){
+    data=read.table(paste0("output/", samples[k],".txt"),comment.char = '',header=T)
+    muts_data=paste(data$X.CHR,data$POS,sep="_")
+    data=data[!duplicated(muts_data),]
+    muts_data=muts_data[!duplicated(muts_data)]
+    rownames(data)=muts_data
+    all_counts[k,,]=as.matrix(data[coords,3:6])
+  }
+  print(k)
+}
+
+#create list of study patients
+#setwd('/lustre/scratch117/casm/team294/to3/testes/tumour/cgpVAF_phase2')
+sample.list <- read.table('patients_all.txt', header = F)[,1]
+
+#generate mutations per patient list
+patient.list <- unique(substr(sample.list, 0, 7))
+
+for(i in patient.list){
+  data <- read.table(paste0(i, '/', list.files(paste0(i, '/'), pattern = '_snp_vaf_nohash.tsv')[1]), comment.char = "", header = T)
+  Muts = paste(data$Chrom, data$Pos, data$Ref, data$Alt, sep="_")
+  write.table(Muts, paste0(i, '/All_mutations_filtered.txt'), col.names = F, row.names = F, quote = F)
+}
+
+#generate a list of samples per tumour
+for(i in patient.list){
+  write.table(unlist(strsplit(list.files(paste0(i, '/'), pattern = '_snps_geno.final.vcf'), '_snps_geno.final.vcf')), paste0(i, '/samples.txt'), col.names = F, row.names = F, quote = F)
+}
+
+# read in the list of study patients
+patients = read.table("patients_all.txt")[,1]
+
+#-------------------------------------------------
+# Run
+#-------------------------------------------------
+
+for (patient in patients){
+  shearwater_probability(patient=patient, save=paste0(patient, "/shearwater_snv_pval_mat.txt"))
+  print(patient)
+}
+
+#get an idea of the mutation burden per sample after this filtering step
+post_swater_mb <- c()
+for (patient in patients){
+  pval_mat = read.table(paste0(patient, "/shearwater_snv_pval_mat.txt"), row.names = 1, sep = ' ', header = T)
+  qval_mat = apply(pval_mat,2,function(x) p.adjust(x,method="BH", n = length(as.matrix(pval_mat))))
+  post_swater_mb <- c(post_swater_mb, colSums(qval_mat < 0.001, na.rm = T))
+  }
+
+#BH correction for multiple testing
+for (patient in patients){
+  pval_mat = read.table(paste0(patient, "/shearwater_snv_pval_mat.txt"), row.names = 1, sep = ' ', header = T)
+  qval_mat = apply(pval_mat,2,function(x) p.adjust(x,method="BH", n = length(as.matrix(pval_mat))))
+  write.table(qval_mat, paste0(patient, "/shearwater_snv_qval_mat.txt"), row.names = T, sep = '\t', quote = F)
+  }
+
+#filter vcf to leave only variants that pass the site specific error threshold
+
+library(VariantAnnotation)
+
+for (patient in patients){
+  qval_mat = read.table(paste0(patient, "/shearwater_snv_qval_mat.txt"), row.names = 1, sep = '\t', header = T)
+  samples = read.table(paste0(patient, "/samples.txt"), sep = '\t', header = F)[,1]
+  for (sample in samples){
+    data = readVcf(paste0(patient, '/', sample, '_snps_geno.final.vcf'))
+    reads = cbind((geno(data)$FAZ)[,2]+(geno(data)$RAZ)[,2],(geno(data)$FCZ)[,2]+(geno(data)$RCZ)[,2],
+                (geno(data)$FGZ)[,2]+(geno(data)$RGZ)[,2],(geno(data)$FTZ)[,2]+(geno(data)$RTZ)[,2])
+    Var = data.frame(Chr=as.character(seqnames(rowRanges(data))),
+                   Pos=start(ranges(rowRanges(data))),
+                   Ref=as.character(ref(data)))
+    Alt_tmp = CharacterList(alt(data))
+    Var$Alt = as.character(unlist(Alt_tmp))
+    Var$NR=rowSums(reads)
+    Var$NV=NA
+    colnames(reads)=c("A","C","G","T")
+    for (k in c("A","C","G","T")){
+      Var$NV[Var$Alt==k] = reads[Var$Alt==k,k]
+    }
+    Var$VAF=Var$NV/Var$NR
+    Var$ID = paste(Var$Chr, Var$Pos, Var$Ref, Var$Alt, sep = '_')
+    qval_patient_sig_muts = row.names(qval_mat[qval_mat[,sample] < 0.001,])
+    swater_filtered_muts = Var[Var$ID %in% qval_patient_sig_muts,]
+    write.table(swater_filtered_muts, paste0(patient, '/', sample, '_post_swater_final_snvs.txt'), sep = '\t', quote = F, row.names = F)
+  }
+}
+
+```
+
+###Indel filtering
+
+Similar to above but, rather than using allelecounter, we used cgpVAF/exonerate for the pileup. It was also run on a per patient basis rather than a single pileup across the cohort.
+
+```{r}
+
+#-------------------------------------------------
+# Libraries
+#-------------------------------------------------
+
+library("GenomicRanges")
+library("deepSNV")
+library("Rsamtools")
+
+logbb = deepSNV:::logbb
+dbetabinom = VGAM::dbetabinom
+
+#-------------------------------------------------
+# Functions
+#-------------------------------------------------
+
+estimateRho_gridml = function(x, mu) {
+  # Estimate rho by MLE grid approach
+  rhovec = 10^seq(-6,-0.5,by=0.05) # rho will be bounded within 1e-6 and 0.32
+  mm = x[,2]
+  cov = c(x[,1])
+  ll = sapply(rhovec, function(rhoj) sum(dbetabinom(x=mm, size=cov, rho=rhoj, prob=mu, log=T)))
+  rhovec[ll==max(ll)][1]
+}
+
+shearwater_indel_probability=function(patient, save=NULL, path_prefix='', rho=10^-3){
+  #Function to calculate probability of presence of mutation based on Shearwater
+  #'patient' is the name of the patient-specific subfolder
+  #'path_prefix' is any prefix to the path necessary to find that subfolder
+  #'rho' is the constant for the overdispersion parameter. If rho=NULL, calculate
+  # it from the data (much slower)
+  #'save' is path for output. If NULL, returns matrix
+  # output of this function will be a matrix (muts by samples) of p values
+  
+  Muts_patient = read.table(paste0(path_prefix, patient, "/All_mutations_filtered.txt"))[,1] #A file of mutations in patient subdirectory (format: Chr_Ref_Pos_Alt)
+  Muts_patient = unique(Muts_patient) #to avoid duplicating variants
+  case_samples = read.table(paste0(path_prefix, patient,"/samples.txt"))[,1] #A file of with the sample names belonging to this patient
+  NR = read.table(paste0(path_prefix, 'NR_all_samples_all_muts.txt'), row.names = 1, header = T, sep = '\t') #total read depth at each variant locus called in this patient across all samples
+  NR[NR == 0] = 1 #to prevent NAs
+  NV = read.table(paste0(path_prefix, 'NV_all_samples_all_muts.txt'), row.names = 1, header = T, sep = '\t') #variant read depth per variant per sample in patient
+  matched_normals = read.table(paste0(path_prefix, 'matched_normals.txt'), header = F, sep = '\t')[,1]
+  matched_normal = matched_normals[grepl(patient, matched_normals)] #picks only this patient's matched normal
+  
+  NR = NR[Muts_patient,] #only mutations relevant to patient
+  NV = NV[Muts_patient,]
+  
+  Depth_filter = rowMeans(NR[, case_samples]) > 10 #Removes remaining globally low coverage variants which were the result of mapping issues
+  
+  NR = NR[Depth_filter,]
+  NV = NV[Depth_filter,]
+  
+  Min_var_depth = rowSums(NV[, case_samples] >= 5) > 0 #removes low VAF sequencing artefacts. This ensures only variants called in a sample to at least 5 variant reads are kept.
+  
+  NR = NR[Min_var_depth,]
+  NV = NV[Min_var_depth,]
+  
+  Muts_patient = row.names(NR) #new, slimmer list to run shearwater-like approach on
+  
+  #Select the normal panel not belonging to this patient with the pileup of sites where variants called in patient's tumour samples
+  normal_panel = normal_samples
+  norm_NR = NR[, normal_panel]
+  norm_NV = NV[, normal_panel]
+  
+  #Set up pval matrix
+  pval_mat = matrix(1,ncol=length(case_samples),nrow=length(Muts_patient))
+  rownames(pval_mat)=Muts_patient
+  colnames(pval_mat)=case_samples
+  
+  coords_proj = paste(matrix(unlist(strsplit(Muts_patient, '_')), ncol = 4, byrow = T)[,1], matrix(unlist(strsplit(Muts_patient, '_')), ncol = 4, byrow = T)[,2], sep = '_')
+  
+  Alt = matrix(unlist(strsplit(Muts_patient, '_')), ncol = 4, byrow = T)[,4]
+  Ref = matrix(unlist(strsplit(Muts_patient, '_')), ncol = 4, byrow = T)[,3]
+  
+  for (s in case_samples){
+    rho_est = rep(NA,length(coords_proj))
+    test_counts_NR = NR[, s]
+    test_counts_NV = NV[, s]
+    
+    for (k in 1:length(coords_proj)) {
+      n = test_counts_NR[k]
+      x = test_counts_NV[k]
+      N_indiv = norm_NR[k,]
+      X_indiv = norm_NV[k,]
+      pseudo = .Machine$double.eps    
+      N = sum(N_indiv)
+      X = sum(X_indiv)
+      mu = max(X,pseudo)/max(N,pseudo)
+      counts = cbind(N,X)
+      
+      if(is.null(rho)) rho = estimateRho_gridml(counts,mu)
+      rdisp = (1 - rho)/rho
+      
+      prob0 = (X + x)/(N + n); prob0[prob0==0] = pseudo; prob0[prob0==1] = 1 - pseudo
+      prob1s = x/(n + pseudo); prob1s[prob1s==0] = pseudo; prob1s[prob1s==1] = 1 - pseudo
+      prob1c = X/(N + pseudo); prob1c[prob1c==0] = pseudo; prob1c[prob1c==1] = 1 - pseudo
+      
+      prob1s = pmax(prob1s,prob1c) # Min error rate is that of the population (one-sided test)
+      nu0 = prob0 * rdisp; nu1s = prob1s * rdisp; nu1c = prob1c * rdisp; 
+      
+      # Likelihood-Ratio Tests
+      LL = logbb(x, n, nu0, rdisp) + logbb(X, N, nu0, rdisp) - logbb(x, n, nu1s, rdisp) - logbb(X, N, nu1c, rdisp)
+      pvals = pchisq(-2*LL, df=1, lower.tail=F) / 2 # We divide by 2 as we are performing a 1-sided test
+      # Saving the result
+      pval_mat[k,s] = pvals
+    } 
+  }
+  pval_mat = pval_mat[((rowSums(norm_NV) / rowSums(norm_NR)) < 0.2) & (NV[, matched_normal]/NR[, matched_normal] < 0.2),] #remove variants seen at a VAF of >0.2 in the normal reference panel or patient's matched normal, these end up being artefactual, even if they are seen at a significantly higher VAF in the tumour samples
+  if(is.null(save)){
+    return(pval_mat)
+  }else{
+    write.table(pval_mat, save)
+  }
+}
+
+#-------------------------------------------------
+# Input
+#-------------------------------------------------
+
+#setwd('/lustre/scratch117/casm/team294/to3/testes/tumour/shearwater_like_indels/20200523')
+#options(stringsAsFactors = F)
+
+#create list of patients
+patient.list <- read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/cgpVAF/SNVs/patients_all.txt', header = F)[,1]
+
+# Vector of normal reference samples, no GCT
+normal_samples = read.table("/lustre/scratch117/casm/team294/to3/testes/tumour/shearwater_like_indels/20200513/rand_norm_reference.txt")[,1] 
+
+# Vector of all tumour samples, used to create a per patient sample list
+tumour_samples = read.table("/lustre/scratch117/casm/team294/to3/testes/tumour/shearwater_like_indels/20200513/gct_samples.txt")[,1]
+
+for (i in unique(substr(tumour_samples, 0, 7))){
+  patient.samples = tumour_samples[grepl(paste0(i), tumour_samples)]
+  patient.samples = data.frame(patient.samples)
+  write.table(patient.samples, paste0(i, '/samples.txt'), sep = '\t', col.names = F, row.names = F, quote = F)
+}
+
+#generate a list of mutations per patient in the format Chr_Ref_Pos_Alt
+patient_muts_input = unlist(list.files('/lustre/scratch117/casm/team294/to3/testes/tumour/cgpVAF_phase2/', pattern = paste0('_indel_vaf_nohash.tsv')))
+
+for (i in unique(substr(tumour_samples, 0, 7))){
+  data <- read.table(paste0(i, '/', i, '.indels.bed'), header = F, sep = '\t')
+  Muts = paste(data$V1,data$V2,data$V3,data$V4,sep="_")
+  write.table(Muts, paste0(i, '/All_mutations_filtered.txt'), sep = '\t', col.names = F, row.names = F, quote = F)
+}
+
+# read in the list of study patients
+patient.list <- read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/cgpVAF/SNVs/patients_all.txt', header = F)[,1]
+
+#-------------------------------------------------
+# Run
+#-------------------------------------------------
+
+for (patient in patient.list){
+  shearwater_indel_probability(patient=patient,save=paste0(patient, "/shearwater_pval_indel_mat.txt"), rho = NULL) 
+  print(patient)
+}
+
+#get an idea of the mutation burden per sample after this filtering step
+post_swater_mb <- c()
+for (patient in patient.list){
+  pval_mat = read.table(paste0(patient, "/shearwater_pval_indel_mat.txt"), sep = ' ', row.names = 1, header = T)
+  qval_mat = apply(pval_mat, 2, function(x) p.adjust(x, method="BH", n = length(as.matrix(pval_mat))))
+  post_swater_mb <- c(post_swater_mb, colSums(qval_mat <= 0.001, na.rm = T))
+}
+
+#BH correction for multiple testing
+for (patient in patient.list){
+  pval_mat = read.table(paste0(patient, "/shearwater_pval_indel_mat.txt"), row.names = 1, sep = ' ', header = T)
+  qval_mat = apply(pval_mat,2,function(x) p.adjust(x,method="BH",n = length(as.matrix(pval_mat))))
+  write.table(qval_mat, paste0(patient, "/shearwater_qval_indel_mat.txt"), row.names = T, sep = '\t', quote = F)
+}
+
+#filter vcf to leave only variants that pass the site specific error threshold
+
+library(VariantAnnotation)
+
+for (patient in patient.list){
+  qval_mat = read.table(paste0(patient, "/shearwater_qval_indel_mat.txt"), row.names = 1, sep = '\t', header = T)
+  #qval_mat[is.na(qval_mat)] = 0.5 #replaces NA values should no longer be required
+  samples = read.table(paste0(patient, "/samples.txt"), sep = '\t', header = F)[,1]
+  for (sample in samples){
+    data = readVcf(paste0('/lustre/scratch119/casm/team294rr/to3/testes/tumour/file_repo/SSMs/matched/', sample, '_indels_geno.final.vcf'))
+    reads = cbind((geno(data)$MTR)[,2], (geno(data)$WTR)[,2])
+    Var = data.frame(Chr = as.character(seqnames(rowRanges(data))), Pos=start(ranges(rowRanges(data))),
+                     Ref=as.character(ref(data)))
+    Alt_tmp = CharacterList(alt(data))
+    Var$Alt = as.character(unlist(Alt_tmp))
+    Var$NR = rowSums(reads)
+    Var$NV = reads[,1]
+    Var$VAF=Var$NV/Var$NR
+    Var$ID = paste(Var$Chr, Var$Pos, Var$Ref, Var$Alt, sep = '_')
+    qval_patient_sig_muts = row.names(qval_mat[qval_mat[,sample] <= 0.001,])
+    swater_filtered_muts = Var[Var$ID %in% qval_patient_sig_muts,]
+    write.table(swater_filtered_muts, paste0(patient, '/', sample, '_post_swater_final_indels.txt'), sep = '\t', quote = F, row.names = F)
+  }
+}
+
+```
+
+The remaining filtering steps for indels are described in the Methods section.
+
+#Mutational signature extraction
+
+Two orthogonal approaches were chosen - non-negative matrix factorization (Sigprofiler v1.015) and the hierarchical Dirchlet process (HDP v0.1.5). SigProfilerExtractor was run with a minimum and maximum of 2 and 20 signatures respectively. All other parameters were as per the default settings. The steps taken whilst running HDP are outlines below.
+
+##HDP_0.1.5 with priors
+
+This code is based off of scripts previously written by Tim Coorens and Daniel Leongamornlert.
+
+###Parts A, B & C
+PART A : Arrange the prior sigs
+PART B : Set up HDP
+PART C : Run posterior sampling chains
+
+```{r}
+
+#/nfs/users/nfs_t/to3/scripts/hdp_prior_single_chain.R
+
+options(stringsAsFactors = F)
+library(hdp)
+lower_threshold=100
+
+n=as.numeric(commandArgs(T)[1])
+mutations=read.table("trinuc_mut_mat.txt")
+key_table=read.table("key_table.txt")
+
+ref = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/MutationalPatterns/reformatted_cosmic_sig_v3.txt', header = T, stringsAsFactors = F, row.names = 1, check.names = F)
+ref = t(ref)
+cosmic.sigs = read.csv('/lustre/scratch119/casm/team294rr/to3/testes/tumour/MutationalPatterns/PCAWG_sigProfiler_SBS_signatures.csv', header = T, stringsAsFactors = F, row.names = 1, check.names = F)
+row.names(cosmic.sigs) = row.names(ref)
+prior_sigs = as.matrix(cosmic.sigs)
+
+# number of prior signatures to condition on (65)
+nps <- ncol(prior_sigs)
+
+# take a look
+#prior_sigs[1:6,1:6]
+# columns should sum to one
+colSums(prior_sigs)
+
+# have a look at the first two prior sigs:
+#barplot(prior_sigs[,1], las=2, cex.names=0.5)
+#barplot(prior_sigs[,2], las=2, cex.names=0.5)
+
+#If requiring a minimum number of mutations:
+sample_remove=rownames(mutations)[rowSums(mutations)<lower_threshold]
+mutations=mutations[!rownames(mutations)%in%sample_remove,]
+key_table=key_table[!key_table$Sample%in%sample_remove,]
+
+#Hierarchy is set per patient, can change if wanted
+freq = table(key_table$Patient)
+
+nps <- ncol(prior_sigs)
+
+luad_prior <- hdp_prior_init(prior_distn = prior_sigs, # matrix of prior sigs
+                             prior_pseudoc = rep(1000, nps), # pseudocount weights
+                             hh=rep(1, 96), # uniform prior over 96 categories
+                             alphaa=c(1, 1), # shape hyperparams for 2 CPs
+                             alphab=c(1, 1)) # rate hyperparams for 2 CPs
+#luad_prior
+#numdp(luad_prior)
+#pseudoDP(luad_prior)
+#conparam(luad_prior)
+#ppindex(luad_prior)
+#cpindex(luad_prior)
+#dpstate(luad_prior) # 2 for active node, 1 for frozen, 0 for heldout
+
+# make two more CPs available for the data we will add
+luad_prior <- hdp_addconparam(luad_prior,
+                              alphaa = rep(1,length(freq)+2), # shape hyperparams for x new CPs
+                              alphab = rep(1,length(freq)+2)) # rate hyperparams for x new CPs
+
+luad_prior <- hdp_adddp(luad_prior,
+                        numdp = nrow(mutations) + 1,
+                        ppindex = c(1, rep(1+nps+1:(length(freq)), times=freq)),
+                        cpindex = c(3, rep(4:(length(freq)+3), times=freq)))
+
+# assign the data to the relevant DP nodes
+luad_prior <- hdp_setdata(luad_prior,
+                          dpindex = (1+nps+1)+1:nrow(mutations), 
+                          mutations) # mutation counts in all GCTs
+
+
+hdp_activated <- dp_activate(luad_prior, 
+                             dpindex = (1+nps+1)+0:nrow(mutations), 
+                             initcc = nps+5,
+                             seed = n * 1000)
+
+chain=hdp_posterior(hdp_activated,
+                    burnin=40000,
+                    n = 200,
+                    seed = n * 1000,
+                    space = 300,
+                    cpiter = 3)
+
+saveRDS(chain,paste0("hdp_prior_chain_",n,".Rdata"))
+
+```
+
+```{bash}
+#in directory with relevant files
+
+export PATH=/software/R-3.6.1/bin:${PATH}
+export R_HOME=$(R RHOME)
+export R_LIBS_USER="~/custom_libraries/R/x86_64-pc-linux-gnu-library/3.6_hdp"
+
+for n in $(seq 1 20);
+do
+bsub -o $PWD/log.%J -e $PWD/err.%J -q normal -R'select[mem>10000] rusage[mem=10000]' -M10000 -J $n /software/R-3.6.1/bin/Rscript /nfs/users/nfs_t/to3/scripts/hdp_prior_single_chain.R $n
+done 
+
+```
+
+###Parts D & E
+PART D : Review diagnostic plots
+PART E : Extract consensus components / signatures
+
+```{r}
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/signature_extraction/hdp_0.1.5')
+
+options(stringsAsFactors = F)
+library(hdp)
+
+chlist <- vector("list", 20)
+for (i in 1:20){
+  if(file.exists(paste0("hdp_prior_chain_",i,".Rdata"))){
+    chlist[[i]] <- readRDS(paste0("hdp_prior_chain_",i,".Rdata"))
+  }
+}
+if(any(unlist(lapply(chlist,is.null)))) chlist=chlist[-which(unlist(lapply(chlist,is.null)))]
+
+luad_multi <- hdp_multi_chain(chlist)
+pdf("QC_plots_chain.pdf") 
+par(mfrow=c(2,2), mar=c(4, 4, 2, 1))
+p1 <- lapply(chains(luad_multi), plot_lik, bty="L", start=1000)
+p2 <- lapply(chains(luad_multi), plot_numcluster, bty="L")
+p3 <- lapply(chains(luad_multi), plot_data_assigned, bty="L")
+dev.off()
+
+#need to remove chains 4, 5, 6, 9, 12, 16, 17
+
+chlist <- vector("list", 20)
+for (i in c(1:3, 7, 8, 10, 11, 13:15, 18:20)){
+  if(file.exists(paste0("hdp_prior_chain_",i,".Rdata"))){
+    chlist[[i]] <- readRDS(paste0("hdp_prior_chain_",i,".Rdata"))
+  }
+}
+if(any(unlist(lapply(chlist,is.null)))) chlist=chlist[-which(unlist(lapply(chlist,is.null)))]
+
+luad_multi <- hdp_multi_chain(chlist)
+
+pdf("QC_plots_chain_after_review.pdf") 
+par(mfrow=c(2,2), mar=c(4, 4, 2, 1))
+p1 <- lapply(chains(luad_multi), plot_lik, bty="L", start=1000)
+p2 <- lapply(chains(luad_multi), plot_numcluster, bty="L")
+p3 <- lapply(chains(luad_multi), plot_data_assigned, bty="L")
+dev.off()
+
+luad_multi <- hdp_extract_components(luad_multi)
+saveRDS(luad_multi,"HDP_multi_chain.Rdata")
+
+#luad_multi = readRDS('HDP_multi_chain.Rdata')
+
+numcomp(luad_multi) #6
+prop.ex(luad_multi) #0.91
+
+pdf("muts_attributed.pdf")
+plot_comp_size(luad_multi, bty="L")
+dev.off()
+
+# plot components / signatures
+# pick your colours
+mut_colours=c("dodgerblue","black","red","grey70","olivedrab3","plum2")
+# labels along bottom x-axis
+trinuc_context <- sapply(strsplit(colnames(mut_count), '\\.'), `[`, 4)
+# group labels along the top (and controls colour grouping)
+group_factor <- as.factor(rep(c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G"),
+                              each=16))
+
+ref = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/MutationalPatterns/reformatted_cosmic_sig_v3.txt', header = T, stringsAsFactors = F, row.names = 1, check.names = F)
+ref = t(ref)
+cosmic.sigs = read.csv('/lustre/scratch119/casm/team294rr/to3/testes/tumour/MutationalPatterns/PCAWG_sigProfiler_SBS_signatures.csv', header = T, stringsAsFactors = F, row.names = 1, check.names = F)
+row.names(cosmic.sigs) = row.names(ref)
+prior_sigs = as.matrix(cosmic.sigs)
+
+# number of prior signatures to condition on (65)
+nps <- ncol(prior_sigs)
+
+pdf(paste0("hdp_components_with_priors.pdf"),width=12,height=4)
+plot_comp_distn(luad_multi, cat_names=trinuc_context,
+                grouping=group_factor, col=mut_colours,
+                col_nonsig="grey97", show_group_labels=TRUE)
+dev.off()
+
+lower_threshold = 100
+mutations=read.table("/lustre/scratch119/casm/team294rr/to3/testes/tumour/HDP/input/trinuc_mut_mat.txt")
+key_table=read.table("/lustre/scratch119/casm/team294rr/to3/testes/tumour/HDP/input/key_table.txt")
+sample_remove=rownames(mutations)[rowSums(mutations)<lower_threshold]
+mutations=mutations[!rownames(mutations)%in%sample_remove,]
+key_table=key_table[!key_table$Sample%in%sample_remove,]
+
+
+pdf("signature_attribution.pdf",width=10,height=8)
+plot_dp_comp_exposure(luad_multi, dpindices = (1+nps+1)+1:nrow(mutations), incl_nonsig = T,
+                      col=c('black', RColorBrewer::brewer.pal(numcomp(luad_multi), "Set1")), cex.names=0.8,
+                      ylab_exp = 'Signature exposure', leg.title = 'Signature')
+dev.off()
+
+mean_assignment=as.data.frame(comp_dp_distn(luad_multi)$mean)
+write.table(mean_assignment,"mean_assignment_prior_hdp.txt")
+mean_sigs=as.data.frame(t(comp_categ_distn(luad_multi)$mean))
+write.table(mean_sigs,"hdp_prior_sigs.txt")
+
+```
+
+###Deconvolute 'novel' signatures
+
+```{r}
+
+#Deconvolute HDP signatures into reference signatures and arrive at final set
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/signature_extraction/hdp_0.1.5')
+
+options(stringsAsFactors = F)
+library(hdp)
+library(RColorBrewer)
+library(lsa)
+library(lattice)
+
+mut.cols = rep(c("dodgerblue","black","red","grey70","olivedrab3","plum2"),each=16)
+
+#Load HDP signatures
+mean_sigs = read.table("hdp_prior_sigs.txt", row.names = 1, header = T)
+hdp_sigs = mean_sigs
+#Load reference signatures, need formatting
+ref = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/MutationalPatterns/reformatted_cosmic_sig_v3.txt', header = T, stringsAsFactors = F, row.names = 1, check.names = F)
+ref = t(ref)
+cosmic.sigs = read.csv('/lustre/scratch119/casm/team294rr/to3/testes/tumour/MutationalPatterns/PCAWG_sigProfiler_SBS_signatures.csv', header = T, stringsAsFactors = F, row.names = 1, check.names = F)
+row.names(cosmic.sigs) = row.names(ref)
+prior_sigs = as.matrix(cosmic.sigs)
+ref = prior_sigs
+
+#Assess cosine similarities for all unassigned signatures (X0, N1, N2)
+cosine_matrix=data.frame(matrix(nrow=ncol(hdp_sigs[, c('X0', 'N1', 'N2')]), ncol=ncol(ref)))
+rownames(cosine_matrix)=colnames(hdp_sigs[, c('X0', 'N1', 'N2')])
+colnames(cosine_matrix)=colnames(ref)
+
+for (n in 1:nrow(cosine_matrix)) {
+  for (m in 1:ncol(cosine_matrix)) {
+    cosine_matrix[n,m] <- cosine(x=hdp_sigs[,rownames(cosine_matrix)[n]],
+                                 y=ref[,colnames(cosine_matrix)[m]])
+  }
+}
+
+write.table(cosine_matrix, "Cosine_similarities_unassigned_to_priors.txt",sep="\t",quote=F)
+
+#cosine_matrix = read.table('Cosine_similarities_unassigned_to_priors.txt', header = T, sep = '\t')
+#rownames(cosine_matrix) = c('X0', 'N1', 'N2')
+hdp_sigs = hdp_sigs[, c('X0', 'N1', 'N2')]
+
+#plot output
+pdf("cosine_similarities_unassigned_to_priors.pdf", height=5, width=15)
+color.palette = colorRampPalette(c("white", "orange", "purple"))
+levelplot(t(cosine_matrix[dim(cosine_matrix)[1]:1,]),col.regions=color.palette, aspect="fill", scales=list(x=list(rot=90)))
+dev.off()
+
+#select which signatures to decompose into reference signatures
+sigs_to_decompose=rowSums(cosine_matrix>0.85)
+for(n in 1:nrow(cosine_matrix)){
+  print(paste0(rownames(cosine_matrix)[n],": ",paste(colnames(cosine_matrix)[cosine_matrix[n,]>0.7],collapse=",")))
+}
+
+#N1 has large error bars and does not look stable across the chains
+
+#"0: SBS3,SBS5,SBS40" stable, flat signature, closest to SBS5, followed by SBS40, then SBS3
+#"N1: SBS3,SBS5,SBS39,SBS40" assortment of flat signature, unstable
+#"N2: SBS31,SBS35" platinum signature
+
+#First iteration; decomposed hdp sigs into all suspected sigs 
+gdsigs=c("SBS3", "SBS5", "SBS31", "SBS35", "SBS39", "SBS40") #0.7 threshold
+
+signatures=t(ref[,gdsigs])
+sample_list= c('X0', 'N1', 'N2')
+profiles=hdp_sigs[,sample_list]
+
+signature_fraction = matrix(NA,nrow=nrow(signatures),ncol=length(sample_list))
+rownames(signature_fraction) = rownames(signatures)
+colnames(signature_fraction) = sample_list
+maxiter <- 1000
+
+for (j in 1:length(sample_list)) {
+  freqs = profiles[,j]
+  freqs[is.na(freqs)] = 0
+  # EM algorithm with to estimate the signature contribution
+  alpha = runif(nrow(signatures)); alpha=alpha/sum(alpha) # Random start (seems to give ~identical results)
+  for (iter in 1:maxiter) {
+    contr = t(array(alpha,dim=c(nrow(signatures),96))) * t(signatures)
+    probs = contr/array(rowSums(contr),dim=dim(contr))
+    probs = probs * freqs
+    old_alpha = alpha
+    alpha = colSums(probs)/sum(probs)
+    if (sum(abs(alpha-old_alpha))<1e-5) {
+      break
+    }
+  }
+  # Saving the signature contributions for the sample
+  print(j/length(sample_list))
+  signature_fraction[,j] = alpha
+}
+
+#Plot initial deconvolution and save results
+pdf("Deconvolution_hdp_sigs_after_prior_R1.pdf", height=5, width=10)
+color.palette = colorRampPalette(c("white", "orange", "purple"))
+levelplot((signature_fraction[nrow(signature_fraction):1,]),col.regions=color.palette, aspect="fill", scales=list(x=list(rot=90)))
+dev.off()
+
+write.table(signature_fraction, "hdp_unassigned_sigs_broken_down_into_cosmic_sigs.txt", sep="\t", col.names=T, row.names = T, quote=F)
+
+```
+
+#Aggregated copy number plotting - study cohort vs TCGA
+
+Turn our battenberg files into a long segment format
+
+```{bash}
+
+cd lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/final_variant_calls/CNA/
+
+for f in $(ls *.battenberg.subclones.txt);
+do
+filename=$(basename -- "$f")
+sampleID="${filename%.battenberg.subclones.txt}"
+python /nfs/users/nfs_t/to3/scripts/copynumber.py -i $sampleID.battenberg.subclones.txt -c $sampleID.battenberg.rho_and_psi_updated.txt -o . -r
+done
+
+```
+
+
+- In-house data binned into 10kb chunks and the copy number across that chunk used according to the Battenberg subclones file.
+- The median CN for each bin per tumour is taken across all invasive samples with a purity >40%.
+- The average of this composite per tumour CN is then taken as the snapshot for the cohort as a whole.
+- Autosomal chromosomes only as we have some ovarian tumours too.
+
+```{bash}
+
+cd /lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp
+
+bsub -G team294-vwork -o $PWD/log.%J -e $PWD/err.%J -q yesterday -R'select[mem>30000] rusage[mem=30000]' -M30000 -J 'gct_cn' /software/R-3.6.1/bin/Rscript lcm_gct_WG_CN.R
+
+```
+
+
+```{r}
+
+#lcm_gct_WG_CN.R
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/')
+
+library(plyr)
+
+#locate copy number files and the eligible samples
+project_dir <- "/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/final_variant_calls/CNA/"
+dna_cuts = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_DNA_supplementary_data.txt', header = T, sep = '\t', stringsAsFactors = F)
+pure_dna_cuts = dna_cuts[dna_cuts$purity > 0.4 & !is.na(dna_cuts$purity) & dna_cuts$Histology != 'GCNIS',] #pure, invasive only
+samples <- pure_dna_cuts$Sample #all samples from all donors
+donors <- unique(substr(samples,1,7)) #all donors
+
+#set bin size
+bin_size <- 10000
+filter_size = 10000 #remove CN changes smaller than this
+adjust = bin_size - 1 #for arranging segments
+
+#chromosome lengths, each will be rounded up to the nearest multiple of 10,000
+chrom_sizes <- read.table('/lustre/scratch119/casm/team294rr/rs30/Testicular_project/Final_Analyses/metadata/male.hg19.chrom.sizes.tsv', header = F, sep = '\t', stringsAsFactors = F)
+chrom_sizes[,2] = round_any(chrom_sizes[,2], bin_size, ceiling) #chunk each chromosome into 10kb bins in order to accurate characterise the CN at the beginning and ends of chromosomes, has to be ceiling to capture the ends
+chrom_sizes[,3] <- cumsum(as.numeric(chrom_sizes[,2]))
+chrom_sizes = chrom_sizes[!chrom_sizes$V1 %in% c('chrM', 'chrX', 'chrY'),]
+chrom_sizes$V4 = c(0, chrom_sizes$V3[1:(length(chrom_sizes$V3) - 1)])
+chrom_sizes$V1 = unlist(lapply(strsplit(chrom_sizes$V1, 'chr'), '[[', 2))
+names(chrom_sizes) = c('chr', 'chr_length', 'cumsum_length', 'prior_wg_length')
+
+#create array with per donor and per 10kb bin cells
+cn_arr <- array(data = NA, dim = c((chrom_sizes[22, 'cumsum_length'] / bin_size), length(donors)))
+colnames(cn_arr) = donors
+cn_df = data.frame(cn_arr)
+
+for(i in 1:length(donors)) {
+  print(donors[i])
+  donor_samples = samples[grepl(donors[i], samples)]
+  donor_sample_arr = array(data = NA, dim = c((chrom_sizes[22, 'cumsum_length'] / bin_size), length(donor_samples))) #need copy number per site per sample first before averaging across donor and ultimately across all tumours
+  colnames(donor_sample_arr) = donor_samples
+  donor_sample_df = data.frame(donor_sample_arr)
+  for(j in 1:length(donor_samples)){
+    if(file.exists(paste0(project_dir,"/",donor_samples[j],"_segments.txt"))){
+    print(donor_samples[j])
+    segments <- read.table(paste0(project_dir,"/",donor_samples[j],"_segments.txt"), sep = "\t", stringsAsFactors = F, header = T)
+    segments = segments[segments$chromosome %in% c(1:22),] #avoid sex chromosomes due to sampling of men and women
+    segments = segments[order(segments$clonal_frequency, decreasing = T),] #order by cn state with greatest clonal frequency first
+    segments = segments[!duplicated(segments[,1:3]),] #only keep the integer value for the copy number state with the highest clonal frequency
+    segments = segments[, c('chromosome', 'start', 'end', 'copy_number')]
+    names(segments) = c('chr', 'startpos', 'endpos', 'ntot')
+    
+  
+    segments = segments[(segments$endpos - segments$startpos) > filter_size,] #minimum copy number segment size
+    segments$startpos = round_any(segments$startpos, bin_size, round) #round start and end positions to nearest 10kb
+    segments$endpos = round_any(segments$endpos, bin_size, round)
+    segments$startcumpos <- segments$startpos #treating genome as one continuous length, generate cumsum postions
+    segments$endcumpos <- segments$endpos
+   
+    
+   for(k in 1:nrow(segments)) { #annotate segments as cumulative positions
+        segments$startcumpos[k] = segments$startpos[k] + chrom_sizes$prior_wg_length[which(chrom_sizes$chr == segments$chr[k])]
+        segments$endcumpos[k] <- segments$endpos[k] + chrom_sizes$prior_wg_length[which(chrom_sizes$chr == segments$chr[k])]
+    }
+    
+    sample_vec = c()
+    for(m in 1:nrow(donor_sample_df)){ #get copy number estimates per 10000bp bin
+      if(nrow(segments[segments$startcumpos <= (bin_size * (m - 1)) & segments$endcumpos >= (bin_size * m),]) > 0) sample_vec = c(sample_vec, segments[segments$startcumpos <= (bin_size * (m - 1)) & segments$endcumpos >= (bin_size * m),]$ntot)
+      else {
+        sample_vec = c(sample_vec, NA)
+      }
+    }
+    donor_sample_df[, donor_samples[j]] = sample_vec
+    }
+  }
+  cn_df[, donors[i]] = apply(donor_sample_df, 1, median, na.rm = T) #median per tumour for that bin
+}
+  
+write.table(cn_df, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/lcm_gct_cn_10000_bp_bin_per_GCT_WG_median.txt', col.names = T, row.names = F, sep = '\t', quote = F) 
+
+```
+
+```{r}
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/')
+
+cn_df = read.table('lcm_gct_cn_10000_bp_bin_per_GCT_WG_median.txt', header = T, sep = '\t', stringsAsFactors = F)
+cn_df$start = c(1:nrow(cn_df))*10000 - 9999
+cn_df$end = c(1:nrow(cn_df))*10000
+
+#adjust for ploidy, to express copy number relative to the overall ploidy 
+dna_cuts = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_DNA_supplementary_data.txt', header = T, sep = '\t', stringsAsFactors = F)
+pure_dna_cuts = dna_cuts[dna_cuts$purity > 0.4 & !is.na(dna_cuts$purity) & dna_cuts$Histology != 'GCNIS',] #pure, invasive only
+lcm_ploidy_table = aggregate(ploidy ~ Case_ID, pure_dna_cuts, median)
+row.names(lcm_ploidy_table) = lcm_ploidy_table$Case_ID
+cn_df[,1:12] = sweep(cn_df[,1:12], 2, lcm_ploidy_table[colnames(cn_df[,1:12]),]$ploidy, FUN = '-', check.margin = T) #adjust the copy number calls for each tumour by their median ploidy
+
+#add further statistics
+#cn_df$all_samples = apply(cn_df[,1:12], MARGIN = 1, FUN = median, na.rm = T) 
+cn_df$all_samples = rowMeans(cn_df[,1:12], na.rm = T)
+cn_df$postp_samples = rowMeans(cn_df[,c(1:3, 5:12)], na.rm = T) 
+cn_df$uq_all_samples = apply(cn_df[,c(1:12)], MARGIN = 1, FUN = function(z) {quantile(z, 0.75, na.rm = T)})
+cn_df$lq_all_samples = apply(cn_df[,c(1:12)], MARGIN = 1, FUN = function(z) {quantile(z, 0.25, na.rm = T)})
+cn_df$uq_postp_samples = apply(cn_df[,c(1:3, 5:12)], MARGIN = 1, FUN = function(z) {quantile(z, 0.75, na.rm = T)})
+cn_df$lq_postp_samples = apply(cn_df[,c(1:3, 5:12)], MARGIN = 1, FUN = function(z) {quantile(z, 0.25, na.rm = T)})
+
+write.table(cn_df, 'lcm_gct_cn_10000_bp_bin_per_GCT_WG_median_extra_cols.txt', col.names = T, row.names = F, sep = '\t', quote = F)
+
+```
+
+- To derive the IQR from the TCGA data, we need to do something similar with the ASCAT segments, also from the hg19 build using the same purity cut-off
+- Using latest ASCAT segmentation and ploidy estimates provided by Peter van Loo and his group for the TCGA data.
+- Limited to tumours which were over 40% pure.
+
+```{bash}
+
+cd /lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp
+
+bsub -G team294-vwork -o $PWD/log.%J -e $PWD/err.%J -q yesterday -R'select[mem>30000] rusage[mem=30000]' -M30000 -J 'tcga_cn' /software/R-3.6.1/bin/Rscript tcga_gct_WG_CN.R
+
+```
+
+```{r}
+
+#tcga_gct_WG_CN.R
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/')
+
+library(plyr)
+
+#get metadata, including ploidy values for all eligible tumours
+tcga_ploidy = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/tcga_tgct/summary.ascatTCGA.penalty70.hg19.tsv', header = T, sep = '\t', stringsAsFactors = F)
+tcga_ploidy = tcga_ploidy[(tcga_ploidy$cancer_type == 'TGCT') & (tcga_ploidy$pass == TRUE) & (tcga_ploidy$rep == TRUE) & (tcga_ploidy$purity > 0.4), ] #103 samples
+
+#get copy segments for all tumours in a single dataframe
+tcga_segment_files = list.files(path = '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/tcga_tgct', pattern = 'segments.txt')
+paste0(tcga_ploidy$name, '.segments.txt') %in% tcga_segment_files #all present in segment files
+
+tcga_ascat_segments = c()
+for(i in tcga_ploidy$name){
+  tumour_file = read.table(paste0('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/tcga_tgct/', i, '.segments.txt'), header = T, sep = '\t', stringsAsFactors = F)
+  tcga_ascat_segments = rbind(tcga_ascat_segments, tumour_file)
+}
+
+names(tcga_ascat_segments) = c('tumour', 'chr', 'start', 'end', 'majA', 'minA')
+tcga_ascat_segments$ntot = tcga_ascat_segments$majA + tcga_ascat_segments$minA
+
+samples <- unique(tcga_ascat_segments$tumour)
+
+#set bin size
+bin_size <- 10000
+filter_size = 10000 #remove CN changes smaller than this
+adjust = bin_size - 1 #for arranging segments
+
+#chromosome lengths, each will be rounded up to the nearest multiple of 10,000
+chrom_sizes <- read.table('/lustre/scratch119/casm/team294rr/rs30/Testicular_project/Final_Analyses/metadata/male.hg19.chrom.sizes.tsv', header = F, sep = '\t', stringsAsFactors = F)
+chrom_sizes[,2] = round_any(chrom_sizes[,2], bin_size, ceiling) #chunk each chromosome into 10kb bins in order to accurate characterise the CN at the beginning and ends of chromosomes, has to be ceiling to capture the ends
+chrom_sizes[,3] <- cumsum(as.numeric(chrom_sizes[,2]))
+chrom_sizes = chrom_sizes[!chrom_sizes$V1 %in% c('chrM', 'chrX', 'chrY'),]
+chrom_sizes$V4 = c(0, chrom_sizes$V3[1:(length(chrom_sizes$V3) - 1)])
+chrom_sizes$V1 = unlist(lapply(strsplit(chrom_sizes$V1, 'chr'), '[[', 2))
+names(chrom_sizes) = c('chr', 'chr_length', 'cumsum_length', 'prior_wg_length')
+
+tcga_ascat_segments = tcga_ascat_segments[(tcga_ascat_segments$end - tcga_ascat_segments$start) > filter_size,]
+tcga_ascat_segments$mod_start = round_any(tcga_ascat_segments$start, bin_size, round) #fit genome to bins of 10,000bp
+tcga_ascat_segments$mod_end = round_any(tcga_ascat_segments$end, bin_size, round)
+tcga_ascat_segments = tcga_ascat_segments[tcga_ascat_segments$chr %in% c(1:22),]
+
+tcga_ascat_segments$startcumpos = tcga_ascat_segments$mod_start
+tcga_ascat_segments$endcumpos = tcga_ascat_segments$mod_end
+
+for(j in 1:nrow(tcga_ascat_segments)) { #annotate segments as cumulative positions
+        tcga_ascat_segments$startcumpos[j] = tcga_ascat_segments$mod_start[j] + chrom_sizes$prior_wg_length[which(chrom_sizes$chr == tcga_ascat_segments$chr[j])]
+        tcga_ascat_segments$endcumpos[j] <- tcga_ascat_segments$mod_end[j] + chrom_sizes$prior_wg_length[which(chrom_sizes$chr == tcga_ascat_segments$chr[j])]
+}
+
+#create array per sample and per 10kb bin cells
+tcga_cn_arr <- array(data = NA, dim = c((chrom_sizes[22, 'cumsum_length'] / bin_size), length(samples)))
+colnames(tcga_cn_arr) = samples
+tcga_cn_df = data.frame(tcga_cn_arr)
+colnames(tcga_cn_df) = gsub('\\.', '-', colnames(tcga_cn_df))
+
+for(k in 1:length(samples)){
+  print(samples[k])
+  for(m in 1:nrow(tcga_cn_df)){ #get copy number estimates per 10000bp bin
+      if(nrow(tcga_ascat_segments[tcga_ascat_segments$startcumpos <= (10000 * (m - 1)) & tcga_ascat_segments$endcumpos >= (10000 * m) & tcga_ascat_segments$tumour == samples[k],]) > 0){
+        tcga_cn_df[m, samples[k]] = tcga_ascat_segments[tcga_ascat_segments$startcumpos <= (10000 * (m - 1)) & tcga_ascat_segments$endcumpos >= (10000 * m) & tcga_ascat_segments$tumour == samples[k],]$ntot
+    }
+  }
+}
+
+write.table(tcga_cn_df, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/tcga_cn_10000_bp_GCT_WG_median.txt', col.names = T, row.names = F, sep = '\t', quote = F) 
+
+```
+
+
+```{r}
+
+tcga_cn_df = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/tcga_cn_10000_bp_GCT_WG_median.txt', header = T, sep = '\t', stringsAsFactors = F, check.names = F)
+
+#read in ploidy values
+#identify samples with RNA seq data
+tcga_ploidy = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/tcga_tgct/summary.ascatTCGA.penalty70.hg19.tsv', header = T, sep = '\t', stringsAsFactors = F)
+tcga_ploidy = tcga_ploidy[(tcga_ploidy$cancer_type == 'TGCT') & (tcga_ploidy$pass == TRUE) & (tcga_ploidy$rep == TRUE) & (tcga_ploidy$purity > 0.4), ] #103 samples
+row.names(tcga_ploidy) = tcga_ploidy$name
+
+#substract the ploidy from the counts for each tumour
+tcga_cn_df = sweep(tcga_cn_df, 2, tcga_ploidy[colnames(tcga_cn_df),]$ploidy, FUN = '-', check.margin = T)
+#tcga_cn_df$all_samples = apply(tcga_cn_df[, 1:103], 1, median, na.rm = T)
+tcga_cn_df$all_samples = rowMeans(tcga_cn_df[, 1:103], na.rm = T)
+tcga_cn_df$start = c(1:nrow(tcga_cn_df))*10000 - 9999
+tcga_cn_df$end = c(1:nrow(tcga_cn_df))*10000
+tcga_cn_df$uq = apply(tcga_cn_df[,1:103], MARGIN = 1, FUN = function(z) {quantile(z, 0.75, na.rm = T)})
+tcga_cn_df$lq = apply(tcga_cn_df[,1:103], MARGIN = 1, FUN = function(z) {quantile(z, 0.25, na.rm = T)})
+
+write.table(tcga_cn_df, 'tcga_cn_10000_bp_GCT_WG_median_extra_cols.txt', col.names = T, row.names = F, sep = '\t', quote = F)
+
+```
+
+```{r}
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/')
+
+library(ggplot2)
+library(ggpubr)
+
+cn_df = read.table('lcm_gct_cn_10000_bp_bin_per_GCT_WG_median_extra_cols.txt', header = T, sep = '\t', stringsAsFactors = F, check.names = F)
+tcga_cn_df = read.table('tcga_cn_10000_bp_GCT_WG_median_extra_cols.txt', header = T, sep = '\t', stringsAsFactors = F, check.names = F)
+
+chrom_sizes <- read.table('/lustre/scratch119/casm/team294rr/rs30/Testicular_project/Final_Analyses/metadata/male.hg19.chrom.sizes.tsv', header = F, sep = '\t', stringsAsFactors = F)
+chrom_sizes[,2] = round_any(chrom_sizes[,2], bin_size, ceiling) #chunk each chromosome into 10kb bins in order to accurate characterise the CN at the beginning and ends of chromosomes, has to be ceiling to capture the ends
+chrom_sizes[,3] <- cumsum(as.numeric(chrom_sizes[,2]))
+chrom_sizes = chrom_sizes[!chrom_sizes$V1 %in% c('chrM', 'chrX', 'chrY'),]
+chrom_sizes$V4 = c(0, chrom_sizes$V3[1:(length(chrom_sizes$V3) - 1)])
+chrom_sizes$V1 = unlist(lapply(strsplit(chrom_sizes$V1, 'chr'), '[[', 2))
+names(chrom_sizes) = c('chr', 'chr_length', 'cumsum_length', 'prior_wg_length')
+
+#get genes loci, examine overall hotspots
+data = read.table("/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/featureCounts/lcm_rna_featurecount_data_preQC_20201013.txt", header = T, sep = '\t', stringsAsFactors = F, check.names = T)
+row.names(data) = data$Geneid
+data$Start = as.numeric(unlist(lapply(strsplit(data$Start, ';'), '[[', 1)))
+data$End = as.numeric(unlist(lapply(strsplit(data$End, ';'), '[[', 1)))
+data$startcumpos = data$Start
+data$endcumpos = data$End
+data = data[data$Chr %in% c(1:22),] #only autosomal chromosomes
+
+for(k in 1:nrow(data)) { #annotate segments as cumulative positions
+    if(data$Chr[k] != "1"){
+        data$startcumpos[k] = data$Start[k] + chrom_sizes$prior_wg_length[which(chrom_sizes$chr == data$Chr[k])]
+        data$endcumpos[k] = data$End[k] + chrom_sizes$prior_wg_length[which(chrom_sizes$chr == data$Chr[k])]
+      }
+}
+data = data[, c('Geneid', 'Chr', 'Start', 'End', 'startcumpos', 'endcumpos')]
+genes_to_plot = data[c('KRAS', 'KIT', 'CCND2'),]
+genes_to_plot$plot_pos = NA
+for(i in 1:nrow(genes_to_plot)){
+  genes_to_plot$plot_pos[i] = cn_df[cn_df$start < genes_to_plot$startcumpos[i] & cn_df$end > genes_to_plot$startcumpos[i], ]$postp_samples
+}
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/lcm_gct_v_tcga_cn_20210209.pdf', height = 3, width = 12, useDingbats = F)
+ggplot() + 
+  scale_x_continuous(expand = c(0,0), breaks = c(chrom_sizes$cumsum_length - (chrom_sizes$chr_length / 2)), labels = c(1:22), limits = c(0, 2881130000)) +
+  geom_ribbon(tcga_cn_df, mapping = aes(x = start, ymin = lq, ymax = uq), alpha = 0.4, colour = 'transparent', fill = '#999999') +
+  geom_point(cn_df, mapping = aes(x = start, y = postp_samples), size = 0.5) + 
+  geom_vline(xintercept = chrom_sizes$prior_wg_length) + labs(y = 'copy number - ploidy', x = 'chr') + theme_pubr() + theme(panel.border = element_rect(fill = NA)) + coord_cartesian(expand = F) + geom_hline(yintercept = 0, col = '#999999', lty = 2) + ylim(-2, 8) + geom_text(genes_to_plot, mapping = aes(x = startcumpos, y = plot_pos + 0.5), label = c('KRAS', 'KIT', 'CCND2'))
+dev.off()
+                                                                                                                                               
+```
+
+#Telomere content modelling
+
+There are many biological and technical factors that influence telomere length estimates. We first review the raw content values and their association with metadata parameters before we construct a linear mixed effects model to adjust for factors that are not of interest.
+
+```{r}
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(ggpubr)
+library(ggbeeswarm)
+library(remef)
+
+telomerehunter_df = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/telomerehunter/gct_telomerehunter_matrix_20201110.txt', sep = '\t', header = T, stringsAsFactors = F) #read in telomerehunter content values for cohort
+telomerehunter_df = telomerehunter_df[telomerehunter_df$patientID != 'PD46967',] #excluded as DNA samples were not included in the study from this patient due to the lack of a matched normal
+
+#make dysgerminoma/seminoma into one category so model as site is already another variable that will discriminate these tissues between testis and ovary
+telomerehunter_df[telomerehunter_df$histology %in% c('Dysgerminoma', 'Seminoma'),]$histology = 'Dysgerminoma/Seminoma'
+
+#plot the variables to assess whether they may impact telomere length
+
+##platform effect
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'tumour',]) + geom_point(mapping = aes(x = histology, y = tel_content, col = platform)) #hiseq seems to have slightly higher telomere lengths
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'tumour',]) + geom_point(mapping = aes(x = histology, y = tel_content, col = platform, shape = site))
+ggplot(telomerehunter_df[telomerehunter_df$histology == 'normal_ST',]) + geom_point(mapping = aes(x = patientID, y = tel_content, col = platform))
+ggplot(telomerehunter_df[telomerehunter_df$histology == 'normal_ST',]) + geom_point(mapping = aes(x = age, y = tel_content, col = platform))
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'tumour' & telomerehunter_df$platform == 'NovaSeq',]) + geom_point(mapping = aes(x = histology, y = tel_content, col = site)) #even in Novaseq only, the telomeres of ovarian tumours were shorter
+
+##age
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'tumour',]) + geom_point(mapping = aes(x = age, y = tel_content, col = histology)) #age effect not appreciable
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'normal',]) + geom_point(mapping = aes(x = age, y = tel_content, col = histology))
+
+##coverage
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'tumour',]) + geom_point(mapping = aes(x = coverage, y = tel_content, col = histology)) #coverage effect not overtly appreciable
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'normal',]) + geom_point(mapping = aes(x = coverage, y = tel_content, col = histology))
+
+##diagnosis
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'tumour',]) + geom_point(mapping = aes(x = histology, y = tel_content, col = diagnosis, shape = site)) #differences perhaps confounded by sequencing platform
+
+#patient
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'tumour',]) + geom_point(mapping = aes(x = histology, y = tel_content, col = patientID, shape = platform)) #reasonable consistency in telomere lengths across histologies between patients
+
+##site
+ggplot(telomerehunter_df[telomerehunter_df$normal.tumour == 'tumour',]) + geom_point(mapping = aes(x = site, y = tel_content, col = patientID, shape = platform)) #all ovarian telomeres are considerably shorter
+
+#create basic models to compare
+##null model
+null_model = lmer(formula = tel_content ~ 0 + (1 | patientID), data = telomerehunter_df, REML = F)
+
+##full model
+full_model = lmer(formula = tel_content ~ 0 + (1 | patientID) + coverage + age + platform + diagnosis + histology + site, data = telomerehunter_df, REML = F)
+
+##compare null and full
+anova(null_model, full_model) #full better than null, fixed effects do seem to impact telomere length, as expect
+
+##optimise model using stepwise algorithm
+step(full_model) #optimum model = tel_content ~ (1 | patientID) + platform + diagnosis + histology + site - 1, age and coverage not very informative
+final_model = lmer(formula = tel_content ~ (1 | patientID) + platform + diagnosis + histology + site - 1, data = telomerehunter_df, REML = F)
+anova(null_model, full_model, final_model) 
+summary(final_model)
+
+#partial regression - to remove the effect of patient and sequencing platform
+full_model.no_patientID_platform_partial = remef(final_model, fix = c("platformHiSeq", "platformNovaSeq"), ran = 'all')
+telomerehunter_df$tel_content_partial = full_model.no_patientID_platform_partial
+telomerehunter_df$diagnosis_plot = telomerehunter_df$diagnosis
+telomerehunter_df[telomerehunter_df$diagnosis %in% c('blood', 'normal_ST'),]$diagnosis_plot = 'Normal'
+
+telomerehunter_df$histology = factor(telomerehunter_df$histology, levels = c('blood', 'normal_ST', 'GCNIS', 'Dysgerminoma/Seminoma', 'Embryonal_carcinoma', 'Yolk_sac_tumour', 'Neuroectoderm', 'Cartilage_teratoma', 'Glandular_teratoma', 'Malignant_stroma', 'Smooth_muscle_teratoma', 'Syncytiotrophoblasts'))
+levels(telomerehunter_df$histology) = c('Blood', 'Seminiferous tubule', 'GCNIS', 'Dysgerminoma/Seminoma', 'Embryonal carcinoma', 'Yolk sac tumour', 'Neuroepithelium', 'Cartilage teratoma', 'Glandular teratoma', 'Malignant stroma', 'Smooth muscle teratoma', 'Syncytiotrophoblasts')
+
+telomerehunter_df$diagnosis_plot_reannot = telomerehunter_df$diagnosis_plot
+telomerehunter_df[telomerehunter_df$diagnosis_plot == 'Seminoma' & telomerehunter_df$histology == 'Dysgerminoma/Seminoma',]$diagnosis_plot_reannot = 'Seminoma, pure seminoma'
+telomerehunter_df[telomerehunter_df$diagnosis_plot == 'Post-pubertal mixed germ cell tumour' & telomerehunter_df$histology == 'Dysgerminoma/Seminoma',]$diagnosis_plot_reannot = 'Dysgerminoma/Seminoma, NSGCT'
+telomerehunter_df[telomerehunter_df$diagnosis_plot == 'Post-pubertal mixed germ cell tumour' & !(telomerehunter_df$histology %in% c('GCNIS', 'Dysgerminoma/Seminoma')),]$diagnosis_plot_reannot = 'Other tissues, NSGCT'
+telomerehunter_df[telomerehunter_df$diagnosis_plot == 'Seminoma' & telomerehunter_df$histology == 'GCNIS',]$diagnosis_plot_reannot = 'GCNIS, pure seminoma'
+telomerehunter_df[telomerehunter_df$diagnosis_plot == 'Post-pubertal mixed germ cell tumour' & telomerehunter_df$histology == 'GCNIS',]$diagnosis_plot_reannot = 'GCNIS, NSGCT'
+
+telomerehunter_df$diagnosis_plot_reannot = factor(telomerehunter_df$diagnosis_plot_reannot, levels = c('Normal', 'GCNIS, pure seminoma', 'GCNIS, NSGCT', 'Seminoma, pure seminoma', 'Dysgerminoma/Seminoma, NSGCT', 'Pre-pubertal yolk sac tumour', 'Other tissues, NSGCT'))
+levels(telomerehunter_df$diagnosis_plot_reannot) = c('Normal', 'GCNIS, pure seminoma', 'GCNIS, NSGCT', 'Seminoma, pure seminoma', 'Dysgerminoma/Seminoma, NSGCT', 'Prepubertal YST', 'Other tissues, NSGCT')
+telomerehunter_df$site = as.factor(telomerehunter_df$site)
+levels(telomerehunter_df$site) = c('Blood', 'Ovary', 'Testis')
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/gct_telomerecontent_by_tissue_by_tumour.pdf', width = 8, height = 6, useDingbats = F)
+ggplot(telomerehunter_df) + 
+  geom_quasirandom(mapping = aes(x = diagnosis_plot_reannot, y = tel_content_partial, col = diagnosis_plot_reannot), cex = 2) + 
+  geom_pointrange(mapping = aes(x = diagnosis_plot_reannot, y = tel_content_partial),
+                  stat = "summary", shape=19, 
+                  fun.min = function(z) {quantile(z,0.25)},
+                  fun.max = function(z) {quantile(z,0.75)},
+                  fun = median, fill="black", cex = 1) +
+  facet_grid(. ~ site, scales = 'free_x', space = 'free_x') + theme_pubr(legend = 'right') + 
+  labs(y = 'Normalised telomere content', x = '') + theme(axis.text.x = element_text(angle = 315, vjust = 1, hjust = 0), strip.background = element_blank(), strip.text.x = element_text(size = 12)) + scale_color_manual(values = c('#999999', as.vector(get_palette(palette = "Dark2", 6))), name = 'Category')
+dev.off()
+
+#get stats to place on plot
+wilcox.test(telomerehunter_df[telomerehunter_df$diagnosis_plot_reannot == 'Dysgerminoma/Seminoma, NSGCT' & telomerehunter_df$site == 'Ovary', ]$tel_content_partial, telomerehunter_df[telomerehunter_df$diagnosis_plot_reannot == 'Dysgerminoma/Seminoma, NSGCT' & telomerehunter_df$site == 'Testis', ]$tel_content_partial, alternative = 'two.sided') #W = 0, p-value = 0.009524 **
+wilcox.test(telomerehunter_df[telomerehunter_df$diagnosis_plot_reannot == 'Other tissues, NSGCT' & telomerehunter_df$site == 'Ovary', ]$tel_content_partial, telomerehunter_df[telomerehunter_df$diagnosis_plot_reannot == 'Other tissues, NSGCT' & telomerehunter_df$site == 'Testis', ]$tel_content_partial, alternative = 'two.sided') #W = 0, p-value = 3.052e-08 ***
+
+#get number of genomes that support each category
+aggregate(tel_content_partial ~ diagnosis_plot_reannot + site, telomerehunter_df, length)
+
+```
+
+#Calculate multiplicity of driver substitutions
+
+Used to time their occurence relative to WGD
+
+```{r}
+
+manifest = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_DNA_supplementary_data.txt', header = T, sep = '\t', stringsAsFactors = F)
+row.names(manifest) = manifest$Sample
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/final_variant_calls/SNV')
+
+#12 25398284 #both KRAS mutations
+#14	105243048 #AKT1 mutation
+
+#"PD45543a_lo0002" "PD45543a_lo0004" "PD45544a_lo0001" "PD45544a_lo0003" "PD45544a_lo0006" "PD45544a_lo0010" "PD45544a_lo0011" "PD45545a_lo0004" "PD45545a_lo0007"
+
+driver_muts = c()
+for(i in manifest[manifest$Case_ID %in% c('PD45543', 'PD45544', 'PD45545') & manifest$Battenberg == 1,]$Sample){
+  mt_df = read.table(paste0(i, '_post_swater_final_snvs.txt'), header = T, sep = '\t', stringsAsFactors = F)
+  mt_df = mt_df[(mt_df$Chr == 12 & mt_df$Pos == 25398284) | (mt_df$Chr == 14 & mt_df$Pos == 105243048),]
+  mt_df$sample = i
+  driver_muts = rbind(driver_muts, mt_df)
+}
+
+driver_muts$purity = manifest[driver_muts$sample,]$purity
+driver_muts$total_cn = c(7, 5, 3, 3, 3, 3, 3, 6, 7) #taken from major clone in Battenberg output
+driver_muts$maj_cn = c(4, 4, 3, 3, 3, 3, 3, 4, 5) #taken from major clone in Battenberg output
+driver_muts$min_cn = driver_muts$total_cn - driver_muts$maj_cn
+driver_muts$mut_multiplicity = driver_muts$VAF * ((driver_muts$total_cn * driver_muts$purity) + (2 * (1 - driver_muts$purity)))/ driver_muts$purity #all consistent with having occurred after WGD
+
+```
+
+
+#Compare truncal mutations against total tumour burden
+
+```{r}
+
+library(reshape2)
+library(ggplot2)
+library(ggpubr)
+
+sub_prop = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/gct_trunk_v_overall_subs.txt', header = T, sep = '\t', stringsAsFactors = F, row.names = 1)
+sub_prop$patient = row.names(sub_prop)
+
+sub_prop.m = reshape2::melt(sub_prop[, c('Truncal.Overall', 'X1...Truncal.Overall.', 'patient')], id.vars = 'patient')
+sub_prop.m$variable = factor(sub_prop.m$variable, levels = c('X1...Truncal.Overall.', 'Truncal.Overall'))
+sub_prop.m$patient = factor(sub_prop.m$patient, levels = c("PD46969", "PD46966", "PD46271", "PD46270", "PD46269", "PD45545", "PD45544", "PD45543", "PD43298", "PD43296", "PD42036", "PD43299"))
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/gct_sub_prop_trunk_v_overall_20210304.pdf', height = 4.5, width = 3, useDingbats = F)
+ggplot(sub_prop.m) + geom_bar(mapping = aes(x = value, y = patient, fill = variable), position="stack", stat="identity") + scale_fill_manual(values = c(NA, '#999999')) + coord_cartesian(expand = F) + ylab('') + xlab('Proportion of substitutions in phylogenetic trunk') + theme_pubr(legend = 'none') + geom_vline(xintercept = median(sub_prop.m[sub_prop.m$variable == 'Truncal.Overall', ]$value), lty = 2) #0.9191559 median
+dev.off()
+
+```
+
+#WGD estimation analysis
+
+Function from PCAWG paper
+
+```{r}
+
+source('/nfs/users/nfs_t/to3/scripts/additional_mutationtimeR_functions.R') #source extra, unchanged functions
+
+#edited functions from mutationtimeR
+findMainCluster <- function(bb, min.dist = 0.05){ #at least 20 SNVs
+    w <- which(bb$n.snv_mnv >= 20 & !is.na(bb$time) & ((bb$time.up - bb$time.lo) < 0.5)) #edited to exclude regions with very wide confidence intervals when, to3 03/03/21 estimating WGD time
+    s <- seq(0,1,0.001) #increased granularity in view of how early WGD is, to3 03/03/21
+    l2 <- pmin(bb$time.lo, bb$time - min.dist)[w]
+    u2 <- pmax(bb$time.up, bb$time + min.dist)[w]
+    l1 <- (l2 +  bb$time[w])/2
+    u1 <- (u2 +  bb$time[w])/2
+    wd <- as.numeric(width(bb)[w])
+    o <- sapply(s, function(i) sum(wd * ( (l2 <= i & u2 >=i) + (l1 <= i & u1 >= i))))
+    s[which.max(o)]
+}
+
+#remove the deamination component as we have too few mutations, especially associated with SBS1 to do this and filter low confidence timing segments from analysis
+computeWgdParam <- function(vcf, bb, clusters, purity, sex){ #added sex in
+    # 1. Find segments compatible with WGD
+    min.dist <- 0.05
+    m <- findMainCluster(bb) #modifed as above to higher confidence regions on which to time WGD, to3 03/03/21
+    l <- pmin(bb$time.lo, bb$time - min.dist)
+    u <- pmax(bb$time.up, bb$time + min.dist)
+    o <- which(l <= m & u >= m & ((bb$time.up - bb$time.lo) < 0.5)) #only going to count and time over segments with higher confidence, to3 03/03/21
+    #note that this line has been left as is in fractionGenomeWgdCompatible as there we only want to know the regions compatable with WGD, not necessarily depend on them all for downstream analyses, , to3 03/03/21
+    # 2. Find substitutions in compatible segments
+    intersect_seg = findOverlaps(vcf, bb[o], ignore.strand = T) #%over% method not working so this is a workaround, to3 03/03/21
+    vcf <- vcf[queryHits(intersect_seg),] 
+    w <- which(info(vcf)$MajCN==2 & sapply(info(vcf)$CNID, length)==1)
+    v <- vcf[w]
+    if(nrow(v)< 100) return(NULL) # At least 100 SNVs total over which to estimate the time of acquisition
+    seqnames(rowRanges(v)) <- factor(3-info(v)$MinCN, levels=seqlevels(v))
+    v <- sort(v)
+    
+    # 3. Merged CN segments
+    b <- GRanges(1:3, IRanges(rep(1,3),rep(max(end(v)),3)), copy_number=4:2, major_cn=2, minor_cn=2:0, clonal_frequency=as.numeric(purity))
+    
+    # 4. Calculate times
+    l <- computeMutCn(v, b, clusters, purity, isWgd=TRUE, n.boot=200, rho=0.01, xmin=3, gender = sex) #recalculates times calculated before on single segments
+    b$n.snv_mnv <- l$n <- table(factor(info(v)$MinCN, levels=2:0))
+    l$time <- bbToTime(b, l$P)
+
+    row.names(l$D) = row.names(info(v)) #get sub annotations back, to3 03/03/21
+    l$cn_state_adj_burden = sum(l$D$MutCN == 2, na.rm = T) + (sum(l$D$MutCN == 2, na.rm = T) * ((unname(l$n['0']) +  unname(l$n['1'])) /  (unname(l$n['0']) +  unname(l$n['1']) + unname(l$n['2'])))) #correct for the 2+1 and 2+0 regions where pre-duplication mutations on the minor allele cannot be counted, to3 04/03/21
+    l$hq_seg_width = sum(width(bb[o][bb[o]$major_cn == 2])) #over what length of the genome were these substitutions identified? to3 03/03/21
+    l$adj_genome_sub_burden = l$cn_state_adj_burden * (genome_length / l$hq_seg_width) #number of mutations estimated to be on both copies, corrected for genome coverage by good confidence WGD segments, to3 04/03/21
+         
+    return(l)
+}
+
+```
+
+Create lists of pertinent input data, including output files from mutationtimeR
+
+```{r}
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/mutationtimeR')
+
+chrom_sizes <- read.table('/lustre/scratch119/casm/team294rr/rs30/Testicular_project/Final_Analyses/metadata/male.hg19.chrom.sizes.tsv', header = F, sep = '\t', stringsAsFactors = F)
+genome_length = sum(chrom_sizes[1:24,]$V2) #3095677412
+
+bb_files = list.files(pattern = '_post_mutationtime_segments.rds')
+
+finalBB <- list()
+for( f in bb_files){
+    g = readRDS(f)
+    finalBB[[unlist(strsplit(f, '_post_mutationtime_segments.rds'))]] <- g
+}
+
+snv_files = list.files(pattern = '_ssm_post_mutationtime.vcf')
+
+finalSnv = list()
+for(f in snv_files){
+  vcf = readVcf(f)
+  finalSnv[[unlist(strsplit(f, '_ssm_post_mutationtime.vcf'))]] <- vcf
+}
+
+cluster_files = list.files(pattern = '_10000iters_3000burnin_bestClusterInfo.txt')
+
+finalClusters <- list()
+for(f in cluster_files){
+  clusters <- read.table(f, sep = '\t', header = T, stringsAsFactors = F)
+  sample = unlist(strsplit(f, '_10000iters_3000burnin_bestClusterInfo.txt'))
+  bb = read.table(paste0(sample, '_post_mutationtime_segments.txt'), sep = '\t', header = T, stringsAsFactors = F)
+  clusters$proportion = clusters$location * max(bb$clonal_frequency)
+  clusters <- clusters[, c('cluster.no', 'proportion', 'no.of.mutations')]
+  names(clusters) <- c('cluster', 'proportion', 'n_ssms')
+  finalClusters[[sample]] <- clusters
+}
+
+purity_files = list.files(pattern = '.battenberg.rho_and_psi_updated.txt')
+
+finalPurity <- numeric()
+for(f in purity_files){
+  pur_df = read.table(f, sep = '\t', header = T, stringsAsFactors = F)
+  purity = pur_df['FRAC_GENOME', 'rho']
+  finalPurity[unlist(strsplit(f, '.battenberg.rho_and_psi_updated.txt'))] = purity
+}
+
+sex_vec = ifelse(grepl('PD455', purity_files), 'female', 'male')
+names(sex_vec) = unlist(strsplit(purity_files, '.battenberg.rho_and_psi_updated.txt'))
+
+```
+
+Sanity check for final, eligible samples - are they consistent with WGD?
+
+```{r}
+
+finalPloidy <- sapply(finalBB, averagePloidy)
+names(finalPloidy) <- names(finalBB)
+
+finalHom <- sapply(finalBB, averageHom)
+names(finalHom) <- names(finalBB)
+
+isWgd <- .classWgd(finalPloidy, finalHom)
+table(isWgd) #all samples classed as WGD based on ploidy and homozygosity
+
+fracGenomeWgdComp <- t(sapply(finalBB, function(bb) {
+                    fgw <- try(fractionGenomeWgdCompatible(bb)); 
+                    if(class(fgw)!='try-error') fgw
+                    else rep(NA,10)}))
+rownames(fracGenomeWgdComp) <- names(finalBB)
+fracGenomeWgdComp = data.frame(fracGenomeWgdComp)
+fracGenomeWgdComp$patient = substr(row.names(fracGenomeWgdComp), 0, 7)
+aggregate(time.wgd ~ patient, fracGenomeWgdComp, median)
+
+#   patient time.wgd
+#  PD42036   0.0220
+#  PD43296   0.0155
+#  PD43298   0.0570
+#  PD43299   0.3935
+#  PD45543   0.0455
+#  PD45544   0.0290
+#  PD45545   0.0195
+#  PD46269   0.0100
+#  PD46271   0.0175
+#  PD46966   0.0380
+#  PD46969   0.0065
+
+```
+
+Generate parameters for estimating the pre-duplication mutation burden.
+
+```{r}
+
+wgdParam <- mclapply(names(finalSnv)[isWgd], function(ID){
+            try(computeWgdParam(finalSnv[[ID]], finalBB[[ID]], clusters=finalClusters[[ID]], purity=finalPurity[ID], sex=sex_vec[ID]))
+        })
+names(wgdParam) <- names(finalSnv)[isWgd]
+void <- sapply(wgdParam, function(x) is.null(x) | class(x)=="try-error") #none
+
+saveRDS(wgdParam, 'mutationtimeR_WGD_segments_20210303.rds')
+
+predup_burden_df = data.frame(sample = names(wgdParam))
+row.names(predup_burden_df) = predup_burden_df$sample
+
+predup_burden_df$adj_genome_sub_burden = NA
+predup_burden_df$hq_seg_width = NA
+
+for(i in 1:nrow(predup_burden_df)){
+  predup_burden_df$adj_genome_sub_burden[i] = wgdParam[[predup_burden_df$sample[i]]]$adj_genome_sub_burden
+  predup_burden_df$hq_seg_width[i] = wgdParam[[predup_burden_df$sample[i]]]$hq_seg_width
+}
+
+predup_burden_df$patient = substr(predup_burden_df$sample, 0, 7)
+predup_burden_df_per_patient = aggregate(adj_genome_sub_burden ~ patient, predup_burden_df, median)
+
+#   patient adj_genome_sub_burden
+#  PD42036              0.000000
+#  PD43296              7.151071
+#  PD43298             13.736280
+#  PD43299            419.612430
+#  PD45543              0.000000
+#  PD45544              0.000000
+#  PD45545              7.617121
+#  PD46269              0.000000
+#  PD46271              5.903524
+#  PD46966              7.210443
+#  PD46969             15.341817
+
+median(predup_burden_df_per_patient[predup_burden_df_per_patient$patient != 'PD43299',]$adj_genome_sub_burden) #6.527298
+
+write.table(fracGenomeWgdComp, 'gct_wgd_estimate_mut_time_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+write.table(predup_burden_df, 'gct_predup_sub_burden_estimate_20210304.txt', col.names = T, row.names = F, sep = '\t', quote = F)
+
+```
+
+```{r}
+
+fracGenomeWgdComp = read.table('gct_wgd_estimate_mut_time_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+library(reshape2)
+library(ggplot2)
+library(ggpubr)
+library(VariantAnnotation)
+library(ggbeeswarm)
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/wgd_timing_per_microbiopsy_20210309.pdf', useDingbats = F, height = 6, width = 6)
+ggplot(fracGenomeWgdComp) +
+  geom_quasirandom(mapping = aes(x = patient, y = time.wgd), col = '#999999') +
+  geom_pointrange(mapping = aes(x = patient, y = time.wgd),
+                  stat = "summary", shape=19, 
+                  fun.min = function(z) {quantile(z,0.25)},
+                  fun.max = function(z) {quantile(z,0.75)},
+                  fun = median, fill="black") +
+  theme_pubr() + ylab('Estimated WGD timing') + xlab('') +
+  scale_x_discrete(expand = c(0,0.5)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0.01)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.8, hjust = 0.9))
+dev.off()
+
+table(fracGenomeWgdComp$patient)
+#PD42036 PD43296 PD43298 PD43299 PD45543 PD45544 PD45545 PD46269 PD46271 PD46966 PD46969 
+#      5      22      20       4       2       5       2       3       2       3       4 
+
+```
+
+##Plot pre-WGD sub burden against truncal mutation burden
+
+```{r}
+
+library(reshape2)
+library(ggplot2)
+library(ggpubr)
+library(VariantAnnotation)
+library(ggbeeswarm)
+
+sub_prop = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/gct_trunk_v_overall_subs.txt', header = T, sep = '\t', stringsAsFactors = F, row.names = 1)
+sub_prop$patient = row.names(sub_prop)
+
+sub_prop.m = reshape2::melt(sub_prop[, c('Truncal.Overall', 'X1...Truncal.Overall.', 'patient')], id.vars = 'patient')
+sub_prop.m$variable = factor(sub_prop.m$variable, levels = c('X1...Truncal.Overall.', 'Truncal.Overall'))
+sub_prop.m$patient = factor(sub_prop.m$patient, levels = c("PD46969", "PD46966", "PD46271", "PD46270", "PD46269", "PD45545", "PD45544", "PD45543", "PD43298", "PD43296", "PD42036", "PD43299"))
+
+timing_tab = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/mutationtimeR/gct_predup_sub_burden_estimate_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/pre_dup_burden_per_microbiopsy_20210304.pdf', useDingbats = F, height = 6, width = 6)
+ggplot(timing_tab) +
+  geom_quasirandom(mapping = aes(x = patient, y = adj_genome_sub_burden), col = '#999999') +
+  geom_pointrange(mapping = aes(x = patient, y = adj_genome_sub_burden),
+                  stat = "summary", shape=19, 
+                  fun.min = function(z) {quantile(z,0.25)},
+                  fun.max = function(z) {quantile(z,0.75)},
+                  fun = median, fill="black") +
+  theme_pubr() + ylab('Estimated pre-duplication substution burden') + xlab('') +
+  scale_x_discrete(expand = c(0,0.5)) +
+  scale_y_continuous(limits = c(0, 500), expand = c(0, 0.1)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.8, hjust = 0.9))
+dev.off()
+
+final_wgd_plotting_agg = aggregate(adj_genome_sub_burden ~ patient, timing_tab, median)
+
+final_wgd_plotting_agg$trunc_mt = NA
+for(i in 1:nrow(final_wgd_plotting_agg)){
+  final_wgd_plotting_agg$trunc_mt[i] = sub_prop[final_wgd_plotting_agg$patient[i], ]$Invasive.truncal.sum
+}
+
+median(final_wgd_plotting_agg[final_wgd_plotting_agg$patient != 'PD43299',]$adj_genome_sub_burden) #6.527298
+final_wgd_plotting_agg$pre_WGD_burden_log = log(final_wgd_plotting_agg$adj_genome_sub_burden + 1) #to keep all values over 0
+final_wgd_plotting_agg$trunc_mt_log = log(final_wgd_plotting_agg$trunc_mt + 1)
+
+final_wgd_plotting_agg.m = reshape2::melt(final_wgd_plotting_agg[, c('patient', 'pre_WGD_burden_log', 'trunc_mt_log')], id.vars = 'patient')
+
+final_wgd_plotting_agg.m$Patient = factor(final_wgd_plotting_agg.m$patient, levels = c("PD46969", "PD46966", "PD46271", "PD46270", "PD46269", "PD45545", "PD45544", "PD45543", "PD43298", "PD43296", "PD42036", "PD43299"))
+final_wgd_plotting_agg.m$variable = factor(final_wgd_plotting_agg.m$variable, levels = c('trunc_mt_log', 'pre_WGD_burden_log'))
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/gct_sub_prop_predup_v_trunc_mt_20210304.pdf', height = 4.5, width = 3, useDingbats = F)
+ggplot(final_wgd_plotting_agg.m) +
+  geom_bar(mapping = aes(x = value, y = Patient, fill = variable), position="dodge", stat="identity") + scale_fill_manual(values = c('grey80', 'grey40')) + coord_cartesian(expand = F, xlim = c(log(0 + 1), log(10000 + 1))) + ylab('') + xlab('Number of substitutions') + theme_pubr(legend = 'none') + scale_x_continuous(breaks = c(log(0 + 1), log(10 + 1), log(100 + 1), log(1000 + 1), log(10000 + 1)), labels = c(0, 10, 100, 1000, 10000)) + geom_vline(xintercept = median(final_wgd_plotting_agg.m[final_wgd_plotting_agg.m$variable == 'pre_WGD_burden_log' & final_wgd_plotting_agg.m$patient != 'PD43299', ]$value), lty = 2) #2.015091, actual value underlying this is 6.527298
+dev.off()
+```
+
+##Estimate the number of cell divisions prior to WGD
+
+
+```{r}
+
+final_wgd_plotting_agg$estimated_postPGC_cell_divisions = final_wgd_plotting_agg$adj_genome_sub_burden / 0.6 #middle of range for estimated subs per cell division
+
+#take estimate of postPGC mutation rate per cell division in testis and ovary from Rahbari et al. 2016
+final_wgd_plotting_agg$estimated_postPGC_cell_divisions_upper = final_wgd_plotting_agg$adj_genome_sub_burden / 0.5
+final_wgd_plotting_agg$estimated_postPGC_cell_divisions_lower = final_wgd_plotting_agg$adj_genome_sub_burden / 0.7
+
+median(final_wgd_plotting_agg[final_wgd_plotting_agg$patient != 'PD43299',]$estimated_postPGC_cell_divisions) #10.87883
+median(final_wgd_plotting_agg[final_wgd_plotting_agg$patient != 'PD43299',]$estimated_postPGC_cell_divisions_lower) #9.324711
+median(final_wgd_plotting_agg[final_wgd_plotting_agg$patient != 'PD43299',]$estimated_postPGC_cell_divisions_upper) #13.0546
+
+min(final_wgd_plotting_agg[final_wgd_plotting_agg$patient != 'PD43299',]$estimated_postPGC_cell_divisions_lower) #0
+max(final_wgd_plotting_agg[final_wgd_plotting_agg$patient != 'PD43299',]$estimated_postPGC_cell_divisions_upper) #30.68363
+
+```
+
+##Compare WGD timing to PCAWG
+
+PCAWG data kindly provided by Peter van Loo
+
+```{r}
+
+summary_data = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_DNA_supplementary_data.txt', header = T, sep = '\t', stringsAsFactors = F)
+row.names(summary_data) = summary_data$Sample
+
+#read in PCAWG data
+pcawg_wgd = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/20190824_timing_gains_adj.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+pcawg_wgd[pcawg_wgd$samplename %in% pcawg_wgd[pcawg_wgd$type == 'WGD',]$samplename,]
+
+
+sample_hist_key = pcawg_wgd[!duplicated(pcawg_wgd[, c('samplename', 'histology_abbreviation')]), c('samplename', 'histology_abbreviation')]
+pcawg_wgd = pcawg_wgd[pcawg_wgd$histology_abbreviation %in% sort(unique(sample_hist_key$histology_abbreviation))[table(sample_hist_key$histology_abbreviation) >= 10], ] #only keep tumour types with at least 10 samples to make proportion values sensible
+
+sample_hist_key = sample_hist_key[sample_hist_key$histology_abbreviation %in% sort(unique(sample_hist_key$histology_abbreviation))[table(sample_hist_key$histology_abbreviation) >= 10], ]
+
+sample_hist_key$WGD = NA
+sample_hist_key$WGD_timing = NA
+
+for(i in 1:nrow(sample_hist_key)){
+  sample_hist_key$WGD[i] = 'No'
+  if(sample_hist_key$samplename[i] %in% pcawg_wgd[pcawg_wgd$chr == 'WGD',]$samplename){
+    sample_hist_key$WGD[i] = 'Yes'
+    sample_hist_key$WGD_timing[i] = pcawg_wgd[pcawg_wgd$samplename == sample_hist_key$samplename[i] & pcawg_wgd$chr == 'WGD',]$time
+  } 
+}
+
+#read in GCT data
+timing_df = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/mutationtimeR/gct_wgd_estimate_mut_time_20210304.txt', sep = '\t', header = T, stringsAsFactors = F)
+
+median_wgd = aggregate(time.wgd ~ patient, timing_df, median)
+median_wgd_postpubertal = median_wgd[median_wgd$patient != 'PD43299',]
+median_wgd_postpubertal$histology_abbreviation = 'Postpubertal_GCT'
+
+gct_samples = data.frame(samplename = median_wgd_postpubertal$patient, histology_abbreviation = rep('Postpubertal_GCT', nrow(median_wgd_postpubertal)), WGD = rep('Yes', nrow(median_wgd_postpubertal)), WGD_timing = median_wgd_postpubertal$time.wgd)
+
+median(median_wgd_postpubertal[median_wgd_postpubertal$patient %in% c('PD45543', 'PD45544', 'PD45545'),]$time.wgd) #post-pubertal ovary 0.029
+median(median_wgd_postpubertal[!median_wgd_postpubertal$patient %in% c('PD45543', 'PD45544', 'PD45545'),]$time.wgd) #post-pubertal testis 0.0175
+
+#combined data gct and pcawg data
+sample_hist_key = rbind(sample_hist_key, gct_samples)
+
+sample_hist_key$WGD_timing_plot = round(sample_hist_key$WGD_timing, digits = 2)
+sample_hist_key[is.na(sample_hist_key$WGD_timing_plot),]$WGD_timing_plot = 'None'
+sample_hist_key$WGD_timing_plot = factor(sample_hist_key$WGD_timing_plot, levels = rev(sort(unique(sample_hist_key$WGD_timing_plot))))
+
+#rank by proportion of samples that undergo WGD and then arrange by the estimated time at which it occurs
+ranked_histo = as.data.frame(unique(sample_hist_key$histology_abbreviation))
+names(ranked_histo) = 'Dx'
+
+ranked_histo$noWGD_count = NA
+ranked_histo$total = NA
+
+for(i in 1:nrow(ranked_histo)){
+  ranked_histo$noWGD_count[i] = nrow(sample_hist_key[sample_hist_key$histology_abbreviation == ranked_histo$Dx[i] & sample_hist_key$WGD == 'No',])
+  ranked_histo$total[i] = nrow(sample_hist_key[sample_hist_key$histology_abbreviation == ranked_histo$Dx[i],])
+}
+
+ranked_histo$prop_noWGD = ranked_histo$noWGD_count / ranked_histo$total
+sample_hist_key$histology_abbreviation = factor(sample_hist_key$histology_abbreviation, levels = ranked_histo[order(ranked_histo$prop_noWGD, decreasing = T),]$Dx)
+
+#g <- colorRampPalette(RColorBrewer::brewer.pal(4,"Set1")[c(3,2,4)])(101)
+g <- colorRampPalette(c('grey80', 'black'))(101)
+names(g) = seq(0.0, 1, 0.01)
+h = c(g, 'white')
+names(h)[102] = 'None'
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/wgd_gct_v_pcawg_plot_20210304.pdf', height = 6, width = 8)
+ggplot(sample_hist_key, aes(x = histology_abbreviation, fill = WGD_timing_plot)) +
+  geom_bar(position="fill") + 
+  scale_fill_manual(values = h) + 
+  coord_cartesian(expand = F) +
+  theme_classic() +
+  theme(legend.position = 'none', axis.text.x = element_text(angle = 90, hjust=0.95,vjust=0.2)) +
+  xlab('')  + ylab('Proportion undergone WGD')
+dev.off()
+
+```
+
+#TCGA chr12 configurations
+
+```{r}
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data')
+
+#get metadata, including ploidy values for all eligible tumours
+tcga_ploidy = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/tcga_tgct/summary.ascatTCGA.penalty70.hg19.tsv', header = T, sep = '\t', stringsAsFactors = F)
+tcga_ploidy = tcga_ploidy[(tcga_ploidy$cancer_type == 'TGCT') & (tcga_ploidy$pass == TRUE) & (tcga_ploidy$rep == TRUE) & (tcga_ploidy$purity > 0.4), ] #103 samples
+
+#get copy segments for all tumours in a single dataframe
+tcga_segment_files = list.files(path = '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/tcga_tgct', pattern = 'segments.txt')
+
+tcga_ascat_segments = c()
+for(i in tcga_ploidy$name){
+  tumour_file = read.table(paste0('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/tcga_tgct/', i, '.segments.txt'), header = T, sep = '\t', stringsAsFactors = F)
+  tcga_ascat_segments = rbind(tcga_ascat_segments, tumour_file)
+}
+
+names(tcga_ascat_segments) = c('tumour', 'chr', 'start', 'end', 'majA', 'minA')
+tcga_ascat_segments$ntot = tcga_ascat_segments$majA + tcga_ascat_segments$minA
+
+tcga_ascat_chr12_segments = tcga_ascat_segments[tcga_ascat_segments$chr == 12,]
+
+#remove all tumours where any region of 12p has a coopy number greater than 4
+write.table(tcga_ascat_chr12_segments[!(tcga_ascat_chr12_segments$tumour %in% (unique(tcga_ascat_chr12_segments[(tcga_ascat_chr12_segments$start < 35800000 & tcga_ascat_chr12_segments$ntot > 4),]$tumour))),], 'tcga_chr12p_low_gain_segments_20210306.txt', col.names = T, row.names = F, sep = '\t', quote = F)
+
+#7 cases show no 12p gains beyond that achieved during WGD.
+
+```
+
+#RNA filtering & pre-processing
+##Filtering
+Raw count table, preQC with genes mapped to nuclear genome only.
+
+```{r}
+
+library(ggplot2)
+library(ggpubr)
+
+raw_data = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/filtering/germ_cell_lcm_rna_preQC.txt', header = T, sep = '\t', stringsAsFactors = F) #just normal testis and GCT raw count data, 500 microbiopsies
+
+#remove transcriptomes that were:
+#- identified as contaminated during microdissection
+#- non-neoplastic tissues that are not healthy seminiferous tubules
+#- uncertainty as to the histological categorisation of the microbiopsy
+
+raw_data = raw_data[, !colnames(raw_data) %in% c("PD43298a_Z1_2_SL02_04_SEC02_04_F2", 'PR43299c_lo0009', 'PR43299c_lo0010', 'PR43299c_lo0011', 'PR43299c_lo0012', "PD43296a_SL02_SEC02_G1", "PD43296a_Z1_2_SL02_04_SEC02_04_E1A", "PD43298a_SL02_SEC02_B3", "PD43298a_SL02_SEC02_C3", "PD43298a_Z1_2_SL02_04_SEC02_04_G2", "PR43299c_lo0002", "PR43299c_lo0006", "PR42036a_SL0D_SEC02_A5", "PR42036a_SL0D_SEC02_G3", "PR42036a_SL0D_SEC02_H3", "PR43298a_SL04_SEC04_D5",             "PR43298a_SL04_SEC04_E5" ,"PR43298a_SL04_SEC04_G9", "PR45543a_SL02_SEC03_B4", "PR45543a_SL02_SEC03_D2", "PR45543a_SL02_SEC03_F2", "PR46269c_SL02_SEC03_E12", "PR46269c_SL02_SEC03_F12", "PR46270c_SL02_SEC03_B5", "PR46270c_SL02_SEC03_C5", "PR46270c_SL02_SEC03_D5", "PR46270c_SL02_SEC03_E3", "PR46270c_SL02_SEC03_F3",             "PR46270c_SL02_SEC03_G3", "PR46270c_SL02_SEC03_H3", "PR46967a_SL02_SEC03_D8", "PR46967a_SL02_SEC03_E4", "PR46967a_SL02_SEC03_G6", "PR46968d_SL02_SEC02_03_H5", "PR46969c_SL02_SEC03_C11", "PR46969c_SL02_SEC03_D11", "PR46969c_SL02_SEC03_E11", "PR46969c_SL02_SEC03_F11", "PR46969c_SL02_SEC03_G11", "PR46969c_SL02_SEC03_H11")] #460 samples left
+
+#how many reads, across all 55502 mapped features do we have?
+summary(colSums(raw_data[, 7:ncol(raw_data)])) #highly variable library sizes
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#   682   86612  246980  502107  651605 3863511 
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/all_samples_read_count_QC.pdf', height = 6, width = 6, useDingbats = F)
+ggplot() +
+  geom_histogram(mapping = aes(colSums(raw_data[, 7:ncol(raw_data)])), bins = 100, fill = '#999999') + theme_pubr() + coord_cartesian(expand = F) + xlab('Number of reads across all mapped features') + ylab('Number of microbiopsies')
+#spike in samples with under 1000 features expressed
+dev.off()
+
+#if we choose a threshold of 5 reads as the minimum to consider a gene truly expressed, how many are expressed per microbiopsy?
+summary(colSums(raw_data[, 7:ncol(raw_data)] >= 5))
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#   0    4150    8916    9077   13654   22865 
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/all_samples_feature_expression_QC.pdf', height = 6, width = 6, useDingbats = F)
+ggplot() +
+  geom_histogram(mapping = aes(colSums(raw_data[, 7:ncol(raw_data)] >= 5)), bins = 100, fill = '#999999') + theme_pubr() + coord_cartesian(expand = F) + geom_vline(xintercept = 1000, lty = 2, col = 'red') + xlab('Features expressed per microbiopsy to a depth of at least 5 reads') + ylim(0, 15) + ylab('Number of microbiopsies')
+#spike in samples with under 1000 features expressed
+dev.off()
+
+```
+
+##Pre-processing 
+
+```{r}
+
+library(limma)
+library(edgeR)
+library(Seurat)
+
+raw_data = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/filtering/germ_cell_lcm_rna_preQC.txt', header = T, sep = '\t', stringsAsFactors = F) #raw count data
+metadata = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_RNA_metadata.txt', header = T, sep = '\t', stringsAsFactors = F) #read in metadata for filtered, final cuts
+row.names(metadata) = metadata$Sample_ID
+gct_mat = raw_data[, 7:ncol(raw_data)]
+row.names(gct_mat) = raw_data$Geneid
+
+#remove cuts that failed QC
+gct_mat = gct_mat[, colnames(gct_mat) %in% metadata$Sample_ID] #416 samples
+
+#define factors that will be input into the model
+histology = factor(metadata[colnames(gct_mat), ]$Updated.Description)
+patient = factor(metadata[colnames(gct_mat), ]$Case_ID)
+metadata = metadata[colnames(gct_mat),]
+
+#preprocessing
+y <- DGEList(counts = gct_mat, group = histology)
+keep <- filterByExpr.default(y, group = histology)
+keep <- filterByExpr(y, group = histology)
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y) #33185 genes kept
+y <- estimateCommonDisp(y) #to generate pseudocounts, adjusted for library size
+pseudo_counts = y$pseudo.counts
+
+#check that the tmm-normalised counts cluster by histology before performing DE analysis
+gct_obj <- CreateSeuratObject(counts = y$pseudo.counts, meta.data = metadata, project = 'gct')
+gct_obj <- NormalizeData(gct_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+gct_obj <- FindVariableFeatures(gct_obj, selection.method = "vst", nfeatures = 1000)
+all.genes <- rownames(gct_obj )
+gct_obj  <- ScaleData(gct_obj , features = all.genes)
+gct_obj <- RunPCA(gct_obj, features = VariableFeatures(object = gct_obj), npcs = 100)
+DimPlot(gct_obj, reduction = "pca", group.by = 'Updated.Description')
+ElbowPlot(gct_obj, ndims = 100)
+gct_obj <- RunUMAP(gct_obj, dims = 1:30)
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/gct_seurat_30_dims_histology_umap_20210304.pdf', width = 8, height = 6, useDingbats = F)
+DimPlot(gct_obj, reduction = "umap", group.by = 'Updated.Description')
+dev.off()
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/gct_seurat_30_dims_patient_umap_20210304.pdf', width = 8, height = 6, useDingbats = F)
+DimPlot(gct_obj, reduction = "umap", group.by = 'Case_ID')
+dev.off()
+
+saveRDS(gct_obj, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/pre_processing/lcm_gct_seurat_object_20210403.rds')
+
+#clusters by histology but also clearly some patient-specific effect which will need to be accounted for in the differential expression analysis
+
+#save filtered raw counts and tmm-normalised counts, plus calculate tpm values
+write.table(pseudo_counts, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/pre_processing/lcm_rna_tmm_norm_counts_20210304.txt', quote = F, col.names = T, row.names = T, sep = '\t')
+
+write.table(y$counts, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/pre_processing/lcm_rna_raw_counts_20210304.txt', quote = F, col.names = T, row.names = T, sep = '\t')
+
+row.names(raw_data) = raw_data$Geneid
+edgeR_gene_data = raw_data[row.names(pseudo_counts),]
+x = pseudo_counts
+x = x / edgeR_gene_data$Length #normalise for transcript length
+tpm <- t( t(x) * 1e6 / colSums(x)) #normalise to read depth
+write.table(tpm, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/pre_processing/tmm_norm_gct_tpm_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+metadata$total_reads_filtered_genes = NA
+
+for(i in 1:nrow(metadata)){
+  metadata$total_reads_filtered_genes[i] = sum(y$counts[, row.names(metadata)[i]])
+}
+
+write.table(metadata, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_RNA_metadata.txt', quote = F, col.names = T, row.names = F, sep = '\t')
+
+```
+
+#Limma-Voom DE analysis between different LCM tissues
+
+Continue with objects from above
+
+```{r}
+
+#specify model to be fitted, no intercept to be fitted, each histology will have its own group mean
+design = model.matrix(~ 0 + histology)
+colnames(design) = levels(histology)
+
+#run double voom to optimise regression weights, adjust for random effect of patient as 'block', may take a couple of hours
+v <- voom(y, design)
+corfit <- duplicateCorrelation(v, design, block = patient)
+v <- voom(y, design, block = patient, correlation = corfit$consensus)
+corfit <- duplicateCorrelation(v, design, block = patient)
+fit <- lmFit(v, design, block = patient, correlation = corfit$consensus)
+corfit$consensus #0.3086162
+
+saveRDS(v, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de/limma_voom_de_LCM_GCT_DE_voom_object_20210304.RDS')
+saveRDS(fit, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de/limma_voom_de_LCM_GCT_DE_model_fit_20210304.RDS')
+
+```
+
+##Against seminiferous tubules
+
+```{r}
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de/')
+
+#General comparison against normal seminiferous tubules, EC and between some other components
+##EC
+cont_matrix = makeContrasts(Embryonal_carcinoma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'ec_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##SEM
+cont_matrix = makeContrasts(Seminoma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'sem_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Adipose teratoma
+cont_matrix = makeContrasts(Adipose_teratoma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'fat_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Cartilage teratoma
+cont_matrix = makeContrasts(Immature_cartilage_teratoma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'cartilage_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Dysgerminoma
+cont_matrix = makeContrasts(Dysgerminoma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'dysgerminoma_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##GCNIS
+cont_matrix = makeContrasts(GCNIS - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'gcnis_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Glandular_teratoma
+cont_matrix = makeContrasts(Mature_glandular_teratoma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'glandter_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Neuroepithelium
+cont_matrix = makeContrasts(Neuroepithelium - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'neuroepi_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Smooth_muscle_teratoma
+cont_matrix = makeContrasts(Smooth_muscle_teratoma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'smoothmusc_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##other immature/indeterminate maturity_teratoma
+cont_matrix = makeContrasts(Other_epithelial_teratoma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'other_ter_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Stroma
+cont_matrix = makeContrasts(Stroma - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'stroma_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Syncytiotrophoblasts
+cont_matrix = makeContrasts(Syncytiotrophoblasts - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'stb_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+##Yolk_sac_tumour
+cont_matrix = makeContrasts(Yolk_sac_tumour - Seminiferous_tubule, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'yst_normtestis_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+```
+
+##Against embryonal carcinoma
+
+```{r}
+
+#Fat vs EC
+cont_matrix = makeContrasts(Adipose_teratoma - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'fat_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#Cartilage vs EC
+cont_matrix = makeContrasts(Immature_cartilage_teratoma - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'cartilage_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#GCNIS vs EC
+cont_matrix = makeContrasts(GCNIS - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'gcnis_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#Glandular_teratoma vs EC
+cont_matrix = makeContrasts(Mature_glandular_teratoma - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'glandter_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#Immature epi_teratoma vs EC
+cont_matrix = makeContrasts(Other_epithelial_teratoma - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'otherter_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#Neuroepithelium vs EC
+cont_matrix = makeContrasts(Neuroepithelium - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'neuroepi_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#SEM vs EC
+cont_matrix = makeContrasts(Seminoma - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'sem_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#Smooth_muscle_teratoma vs EC
+cont_matrix = makeContrasts(Smooth_muscle_teratoma - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'smoothmusc_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#Stroma vs EC
+cont_matrix = makeContrasts(Stroma - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'stroma_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#Syncytiotrophoblasts vs EC
+cont_matrix = makeContrasts(Syncytiotrophoblasts - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'stb_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#Yolk_sac_tumour vs EC
+cont_matrix = makeContrasts(Yolk_sac_tumour - Embryonal_carcinoma, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(y$counts), sort.by = "P")
+head(top.table, 20)
+write.table(top.table, 'yst_ec_voom_de_20210304.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+```
+
+#Comparing expression of fetal and lineage-specific genes between GCTs and reference single cell data
+
+Using tpm values
+
+```{r}
+
+library(ggplot2)
+library(reshape2)
+library(cowplot)
+library(Seurat)
+library(ggbeeswarm)
+library(dplyr)
+library(ggpubr)
+library(gridExtra)
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets')
+
+#read in scRNA seurat objects containing the count data
+testis_ref = readRDS('postnatal_testis_final.rds') #neonatal and adult testis - Sohni et al.
+fetal_brain = readRDS('pfc_final.rds') #fetal brain tissues - Zhong et al.
+adult_brain = readRDS('adult_brain_li.rds') #adult brain - Li et al.
+fetal_muscle = readRDS('fetal_muscle_cao.rds') #fetal cardiac, smooth and skeletal muscle - Cao et al.
+adult_smooth_musc = readRDS('adult_smooth_muscle.rds') #adult cardiac, smooth and skeletal muscle - Litviňuková et al.
+
+#read in our TPM data
+gct_tpm = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/pre_processing/tmm_norm_gct_tpm_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+#merge reference scRNA data and restrict to genes also found in our data
+ref_scrna = merge(testis_ref, y = c(fetal_brain, adult_brain, fetal_muscle, adult_smooth_musc), add.cell.ids = c("testis", "fetal_brain", "adult_brain","fetal_smooth_muscle", "adult_smooth_muscle"), project = 'ref_scrna_data') #49128 features across 32036 samples within 1 assay 
+
+genes_to_keep = row.names(ref_scrna)[row.names(ref_scrna) %in% row.names(pseudo_counts)]
+
+ref_scrna_final = CreateSeuratObject(counts = ref_scrna@assays$RNA@counts[genes_to_keep,], project = 'final_ref_scrna', assay = 'RNA', meta.data = ref_scrna@meta.data) #27569 features across 46195 samples within 1 assay
+
+ref_scrna_final = subset(ref_scrna_final, subset = cell_types != 'Microglia' & cell_types != 'Pre-Spermatogonia') #27168 features across 32036 samples within 1 assay
+
+ref_scrna_final = NormalizeData(object = ref_scrna_final, normalization.method = "LogNormalize")
+all.genes <- rownames(ref_scrna_final)
+ref_scrna_final <- ScaleData(ref_scrna_final, features = all.genes)
+ref_scrna_final@meta.data$cell_types = factor(ref_scrna_final@meta.data$cell_types)
+
+levels(ref_scrna_final@meta.data$cell_types) = c("Adult astrocytes", "Fetal astrocytes", "Fetal excitatory neurons", "Adult excitatory neurons", "Fetal cardiac smooth muscle cells", "Adult interneurons", "Fetal interneurons", "Fetal other smooth muscle cells", "Fetal neuronal stem cells", "Adult oligodendrocytes", "Adult oligodendrocyte progenitor cells", "Fetal oligodendrocyte progenitor cells", "PGC-like", "Adult other smooth muscle cells", "Spermatid", "Spermatocytes", "Spermatogonia")
+
+saveRDS(ref_scrna_final, 'reference_scrna.rds')
+
+#ref_scrna_final = readRDS('reference_scrna.rds')
+
+ref_scrna_final@meta.data$cell_types = as.factor(ref_scrna_final@meta.data$cell_types)
+
+ref_scrna_final@meta.data$cell_types = factor(ref_scrna_final@meta.data$cell_types, levels = rev(c("PGC-like", "Spermatogonia", "Spermatocytes", "Spermatid", "Fetal neuronal stem cells", "Fetal oligodendrocyte progenitor cells", "Adult oligodendrocyte progenitor cells", "Adult oligodendrocytes", "Fetal astrocytes", "Adult astrocytes", "Fetal interneurons", "Adult interneurons", "Fetal excitatory neurons", "Adult excitatory neurons", "Fetal cardiac smooth muscle cells", "Fetal other smooth muscle cells", "Adult other smooth muscle cells")))
+
+#limit gct tpm counts to genes shared between datasets
+gct_tpm_filtered = gct_tpm[row.names(ref_scrna_final),]
+gct_log2tpm <- log2(as.matrix(gct_tpm_filtered) + 1)
+rna_cuts = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_RNA_metadata.txt', header = T, sep = '\t', stringsAsFactors = F)
+row.names(rna_cuts) = rna_cuts$Sample_ID
+
+#extract ref data counts and convert to tpm
+ref_scrna_final_df = as.data.frame(ref_scrna_final@assays$RNA@counts)
+write.table(ref_scrna_final_df, 'reference_scrna_counts.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+ref_scrna_final_tpm <- t( t(ref_scrna_final_df) * 1e6 / colSums(ref_scrna_final_df)) #tpm conversion, 
+ref_scrna_final_log2tpm <- log2(as.matrix(ref_scrna_final_tpm) + 1)
+
+write.table(ref_scrna_final_log2tpm, 'reference_scrna_log2tpm.txt', col.names = T, row.names = T, sep = '\t', quote = F)
+
+#ref_scrna_final_log2tpm = read.table('reference_scrna_log2tpm.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+ref_scrna_final@meta.data$sample = row.names(ref_scrna_final@meta.data)
+ref_scrna_final@meta.data$source = 'scrna'
+ref_scrna_final_meta = ref_scrna_final@meta.data[, c('sample', 'cell_types', 'source')]
+
+rna_cuts$cell_types = rna_cuts$Updated.Description
+rna_cuts$sample = row.names(rna_cuts)
+rna_cuts$source = 'lcm'
+gct_final_meta = rna_cuts[, c('sample', 'cell_types', 'source')]
+
+all_data_final_log2tpm = cbind(ref_scrna_final_log2tpm, gct_log2tpm)
+all_data_final_meta = rbind(ref_scrna_final_meta, gct_final_meta)
+
+colnames(all_data_final_log2tpm) = gsub('\\.', '_', colnames(all_data_final_log2tpm))
+row.names(all_data_final_meta) = gsub('-', '_', row.names(all_data_final_meta))
+row.names(all_data_final_meta) = gsub('\\.', '_', row.names(all_data_final_meta))
+
+#germ cell comparison
+gc_exp = all_data_final_log2tpm[,row.names(all_data_final_meta[all_data_final_meta$cell_types %in% c('PGC-like', 'Spermatogonia', 'Spermatocytes', 'Spermatid', 'GCNIS', 'Seminoma', 'Dysgerminoma', 'Seminiferous_tubule'), ])]
+gc_exp.t = as.data.frame(t(as.data.frame(gc_exp)))
+gc_exp.t$cell_types = all_data_final_meta[row.names(gc_exp.t),]$cell_types
+gc_exp.t$sample = row.names(gc_exp.t)
+gc_exp.t.m = reshape2::melt(gc_exp.t[, c('cell_types', 'sample', 'POU5F1', 'NANOG', 'SOX17', 'DDX4', 'TNP1')], id.vars = c('cell_types', 'sample'))
+
+gc_exp.t.m$gene_use = NA
+for(i in 1:nrow(gc_exp.t.m)){
+  if(gc_exp.t.m$variable[i] %in% c('POU5F1', 'NANOG', 'SOX17')) gc_exp.t.m$gene_use[i] = 'fetal'
+  if(gc_exp.t.m$variable[i] == 'DDX4') gc_exp.t.m$gene_use[i] = 'gen_gc'
+  if(gc_exp.t.m$variable[i] == 'TNP1') gc_exp.t.m$gene_use[i] = 'spermatid'
+}
+
+gc_exp.t.m$gene_use = factor(gc_exp.t.m$gene_use, levels = c('fetal', 'gen_gc', 'spermatid'))
+gc_exp.t.m$cell_types = factor(gc_exp.t.m$cell_types, levels = c('PGC-like', 'Spermatogonia', 'Spermatocytes', 'Spermatid', 'GCNIS', 'Seminoma', 'Dysgerminoma', 'Seminiferous_tubule'))
+
+aggregate(value ~ cell_types + variable, gc_exp.t.m, length) #Dysgerminoma will need individual data points for DDX4 and TNP1 plotting
+
+p1 = ggplot(gc_exp.t.m, mapping = aes(x = gene_use, y = value)) + 
+  geom_quasirandom(dodge.width=.8, cex=1, aes(x = gene_use, y = value), shape = 21, fill = 'transparent', col = 'transparent') + 
+  geom_beeswarm(data = gc_exp.t.m[gc_exp.t.m$cell_types == 'Dysgerminoma' & gc_exp.t.m$variable %in% c('DDX4', 'TNP1'), ], mapping = aes(x = gene_use, y = value), dodge.width=1, cex=1, shape = 21, fill = 'black', col = 'black') + 
+  facet_wrap(. ~ cell_types, strip.position = 'bottom', ncol = 8) +
+  theme_pubr() + 
+  theme(axis.text.x = element_blank(), 
+        panel.spacing = unit(0, "mm"), 
+        strip.background = element_blank(), 
+        strip.placement = "outside", 
+        legend.position = 'none', 
+        axis.ticks.x = element_blank()) +
+  labs(y = 'Log2(TPM) expression', x = '') + 
+  geom_pointrange(mapping = aes(col = gene_use), stat = "summary", shape=19, fun.min = function(z) {quantile(z,0.25)}, 
+                  fun.max = function(z) {quantile(z,0.75)}, 
+                  fun = median, size = 0.8, fatten = 5, linetype = 2) + 
+  scale_color_manual(values = c('#FF6C5C', '#58CCED', '#072F5F'))
+
+#neural comparison
+ne_exp = all_data_final_log2tpm[,row.names(all_data_final_meta[all_data_final_meta$cell_types %in% c('Neuroepithelium', 'Fetal interneurons', 'Fetal neuronal stem cells', 'Fetal oligodendrocyte progenitor cells', 'Fetal astrocytes', 'Fetal excitatory neurons', 'Adult interneurons', 'Adult oligodendrocyte progenitor cells', 'Adult astrocytes', 'Adult excitatory neurons', 'Adult oligodendrocytes'), ])]
+ne_exp.t = as.data.frame(t(as.data.frame(ne_exp)))
+ne_exp.t$cell_types = all_data_final_meta[row.names(ne_exp.t),]$cell_types
+ne_exp.t$sample = row.names(ne_exp.t)
+ne_exp.t.m = reshape2::melt(ne_exp.t[, c('cell_types', 'sample', 'PAX6', 'SOX2', 'NES', 'MBP', 'SLC1A2', 'RBFOX3', 'GAD1')], id.vars = c('cell_types', 'sample'))
+
+ne_exp.t.m$gene_use = NA
+for(i in 1:nrow(ne_exp.t.m)){
+  if(ne_exp.t.m$variable[i] %in% c('PAX6', 'SOX2', 'NES')) ne_exp.t.m$gene_use[i] = 'fetal'
+  if(ne_exp.t.m$variable[i] == 'MBP') ne_exp.t.m$gene_use[i] = 'oligo'
+  if(ne_exp.t.m$variable[i] == 'SLC1A2') ne_exp.t.m$gene_use[i] = 'astro'
+  if(ne_exp.t.m$variable[i] == 'RBFOX3') ne_exp.t.m$gene_use[i] = 'neun'
+  if(ne_exp.t.m$variable[i] == 'GAD1') ne_exp.t.m$gene_use[i] = 'inter'
+}
+
+ne_exp.t.m$gene_use = factor(ne_exp.t.m$gene_use, levels = c('fetal', 'oligo', 'astro', 'neun', 'inter'))
+ne_exp.t.m$cell_types = factor(ne_exp.t.m$cell_types, levels = c('Fetal neuronal stem cells', 'Fetal oligodendrocyte progenitor cells', 'Fetal astrocytes', 'Fetal excitatory neurons', 'Fetal interneurons', 'Adult oligodendrocyte progenitor cells', 'Adult oligodendrocytes', 'Adult astrocytes', 'Adult excitatory neurons', 'Adult interneurons', 'Neuroepithelium'))
+
+aggregate(value ~ cell_types + variable, ne_exp.t.m, length)
+
+p2 = ggplot(ne_exp.t.m, mapping = aes(x = gene_use, y = value)) + 
+  geom_quasirandom(dodge.width=.8, cex=1, aes(x = gene_use, y = value), shape = 21, fill = 'transparent', col = 'transparent') + 
+  facet_wrap(. ~ cell_types, strip.position = 'bottom', ncol = 11) +
+  theme_pubr() + 
+  theme(axis.text.x = element_blank(), 
+        panel.spacing = unit(0, "mm"), 
+        strip.background = element_blank(), 
+        strip.placement = "outside", 
+        legend.position = 'none', 
+        axis.ticks.x = element_blank()) +
+  labs(y = 'Log2(TPM) expression', x = '') + 
+  geom_pointrange(mapping = aes(col = gene_use), stat = "summary", shape=19, fun.min = function(z) {quantile(z,0.25)}, 
+                  fun.max = function(z) {quantile(z,0.75)}, 
+                  fun = median, size = 0.8, fatten = 5, linetype = 2) + 
+  scale_color_manual(values = c('#FF6C5C', '#58CCED', '#3895D3', '#1261A0', '#072F5F'))
+
+#smooth muscle comparison
+sm_exp = all_data_final_log2tpm[,row.names(all_data_final_meta[all_data_final_meta$cell_types %in% c("Fetal cardiac smooth muscle cells", "Fetal other smooth muscle cells", "Adult other smooth muscle cells", "Smooth_muscle_teratoma"), ])]
+sm_exp.t = as.data.frame(t(as.data.frame(sm_exp)))
+sm_exp.t$cell_types = all_data_final_meta[row.names(sm_exp.t),]$cell_types
+sm_exp.t$sample = row.names(sm_exp.t)
+sm_exp.t.m = reshape2::melt(sm_exp.t[, c('cell_types', 'sample', 'IGF2', 'TAGLN', 'ACTA2', 'MYH11')], id.vars = c('cell_types', 'sample'))
+
+sm_exp.t.m$gene_use = NA
+for(i in 1:nrow(sm_exp.t.m)){
+  if(sm_exp.t.m$variable[i] %in% c('TAGLN', 'ACTA2', 'MYH11')) sm_exp.t.m$gene_use[i] = 'adult'
+  if(sm_exp.t.m$variable[i] == 'IGF2') sm_exp.t.m$gene_use[i] = 'fetal'
+}
+
+sm_exp.t.m$gene_use = factor(sm_exp.t.m$gene_use, levels = c('fetal', 'adult'))
+sm_exp.t.m$cell_types = factor(sm_exp.t.m$cell_types, levels = c("Fetal cardiac smooth muscle cells", "Fetal other smooth muscle cells", "Adult other smooth muscle cells", "Smooth_muscle_teratoma"))
+
+aggregate(value ~ cell_types + variable, sm_exp.t.m, length) #add data points for GCT data for IGF2
+
+p3 = ggplot(sm_exp.t.m, mapping = aes(x = gene_use, y = value)) + 
+  geom_quasirandom(dodge.width=.8, cex=1, aes(x = gene_use, y = value), shape = 21, fill = 'transparent', col = 'transparent') + 
+  geom_beeswarm(data = sm_exp.t.m[sm_exp.t.m$cell_types == 'Smooth_muscle_teratoma' & sm_exp.t.m$variable == 'IGF2', ], mapping = aes(x = gene_use, y = value), dodge.width=1, cex=1, shape = 21, fill = 'black', col = 'black') + 
+  facet_wrap(. ~ cell_types, strip.position = 'bottom', ncol = 8) +
+  theme_pubr() + 
+  theme(axis.text.x = element_blank(), 
+        panel.spacing = unit(0, "mm"), 
+        strip.background = element_blank(), 
+        strip.placement = "outside", 
+        legend.position = 'none', 
+        axis.ticks.x = element_blank()) +
+  labs(y = 'Log2(TPM) expression', x = '') + 
+  geom_pointrange(mapping = aes(col = gene_use), stat = "summary", shape=19, fun.min = function(z) {quantile(z,0.25)}, 
+                  fun.max = function(z) {quantile(z,0.75)}, 
+                  fun = median, size = 0.8, fatten = 5, linetype = 2) + 
+  scale_color_manual(values = c('#FF6C5C', '#58CCED'))
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/log2tpm_expression_gct_vs_ref_tissue20210305.pdf', width = 14, height = 9, useDingbats = F)
+ggdraw() +
+  draw_plot(p1, 0, 2/3, 8/11, 1/3) +
+  draw_plot(p2, 0, 1/3, 1, 1/3) +
+  draw_plot(p3, 0, 0, 4.25/11, 1/3) +
+  draw_plot_label(c("A", "B", "C"), c(0, 0, 0), c(1, 2/3, 1/3), size = 15)
+dev.off()
+
+```
+
+#Volcano plots of differential expression analysis between embryonal carcinoma and other GCT tissues
+```{r}
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de')
+
+library(EnhancedVolcano)
+library(cowplot)
+
+#read in example DE analyses
+ne_v_ec = read.table('neuroepi_ec_voom_de_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+sm_v_ec = read.table('smoothmusc_ec_voom_de_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+ct_v_ec = read.table('cartilage_ec_voom_de_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+p1 = EnhancedVolcano(ne_v_ec,
+    lab = rownames(ne_v_ec),
+    x = 'logFC',
+    y = 'adj.P.Val', selectLab = c('SOX1', 'SOX3', 'PAX6', 'CDH2', 'SOX2', 'POU5F1', 'NANOG'), 
+    title = 'Neuroepithelium',
+    subtitle = '',
+    labFace = 'bold', 
+    boxedLabels = T, 
+    drawConnectors = TRUE,
+    widthConnectors = 1.0,
+    typeConnectors = 'open',
+    colConnectors = 'black', 
+    legendPosition = 'none', 
+    pCutoff = 0.01,
+    FCcutoff = 2,
+    labSize = 5, 
+    gridlines.major = FALSE,
+    gridlines.minor = FALSE,
+    caption = '')
+p2 = EnhancedVolcano(sm_v_ec,
+    lab = rownames(sm_v_ec),
+    x = 'logFC',
+    y = 'adj.P.Val', selectLab = c('MYOCD', 'ACTA2', 'MIR145', 'MIR143HG', 'SOX2', 'POU5F1', 'NANOG'), 
+    title = 'Smooth muscle teratoma',
+    subtitle = '',
+    labFace = 'bold', 
+    boxedLabels = T, 
+    drawConnectors = TRUE,
+    widthConnectors = 1.0,
+    typeConnectors = 'closed',
+    colConnectors = 'black', 
+    legendPosition = 'none', 
+    pCutoff = 0.01,
+    FCcutoff = 2,
+    labSize = 5, 
+    gridlines.major = FALSE,
+    gridlines.minor = FALSE,
+    caption = '')
+p3 = EnhancedVolcano(ct_v_ec,
+    lab = rownames(ct_v_ec),
+    x = 'logFC',
+    y = 'adj.P.Val', selectLab = c('COL2A1', 'SOX9', 'ACAN', 'COMP', 'SOX2', 'POU5F1', 'NANOG'), 
+    title = 'Cartilage teratoma',
+    subtitle = '',
+    labFace = 'bold', 
+    boxedLabels = T, 
+    drawConnectors = TRUE,
+    widthConnectors = 1.0,
+    typeConnectors = 'closed',
+    colConnectors = 'black', 
+    legendPosition = 'none', 
+    pCutoff = 0.01,
+    FCcutoff = 2,
+    labSize = 5,
+    gridlines.major = FALSE,
+    gridlines.minor = FALSE,
+    caption = '')
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/gct_tissues_v_ec_de_plot_20210304.pdf', height = 6, width = 18, useDingbats = F)
+plot_grid(p3, p1, p2, ncol = 3, align = 'h')
+dev.off()
+
+```
+
+#Cytoband-level gene expression by GCT tissue
+
+```{r}
+
+library(msigdbr)
+library(limma)
+library(scales)
+library(ggpubr)
+library(reshape2)
+library(ComplexHeatmap)
+library(circlize)
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de')
+
+gct_v = readRDS('limma_voom_de_LCM_GCT_DE_voom_object_20210304.RDS')
+gct_fit = readRDS('limma_voom_de_LCM_GCT_DE_model_fit_20210304.RDS')
+
+contr.matrix <- makeContrasts(
+  fat_v_st = Adipose_teratoma - Seminiferous_tubule,
+  dys_v_st = Dysgerminoma - Seminiferous_tubule,
+  ec_v_st = Embryonal_carcinoma - Seminiferous_tubule,
+  gcnis_v_st = GCNIS - Seminiferous_tubule,
+  cartilage_v_st = Immature_cartilage_teratoma - Seminiferous_tubule, 
+  glandular_v_st = Mature_glandular_teratoma - Seminiferous_tubule, 
+  ne_v_st = Neuroepithelium - Seminiferous_tubule, 
+  other_ter_v_st = Other_epithelial_teratoma - Seminiferous_tubule, 
+  muscle_v_st = Smooth_muscle_teratoma - Seminiferous_tubule, 
+  sct_v_st = Syncytiotrophoblasts - Seminiferous_tubule, 
+  yst_v_st = Yolk_sac_tumour - Seminiferous_tubule, 
+  sem_v_st = Seminoma - Seminiferous_tubule,
+  str_v_st = Stroma - Seminiferous_tubule,
+  levels = colnames(gct_fit$design))
+
+all_hum_gene_sets = msigdbr(species = "Homo sapiens")
+
+c1_gene_set = list()
+
+for(i in unique(all_hum_gene_sets[all_hum_gene_sets$gs_cat == 'C1', ]$gs_name)){
+  c1_gene_set[[i]] = all_hum_gene_sets[all_hum_gene_sets$gs_cat == 'C1' & all_hum_gene_sets$gs_name == i, ]$human_gene_symbol
+}
+c1_idx <- ids2indices(c1_gene_set,id=rownames(gct_v))
+
+all_histo_regions_enrich = c()
+for(i in 1:ncol(contr.matrix)){
+  temp = camera(gct_v, c1_idx, gct_fit$design, contrast = contr.matrix[,i])
+  tissue = names(contr.matrix[,i][contr.matrix[,i] == 1])
+  temp$tissue = tissue
+  temp$cytoband = row.names(temp)
+  row.names(temp) = NULL
+  all_histo_regions_enrich = rbind(all_histo_regions_enrich, temp)
+}
+
+all_histo_regions_enrich$chr = substr(unlist(lapply(strsplit(all_histo_regions_enrich$cytoband, 'p|q'), '[[', 1)), 4, 5)
+all_histo_regions_enrich$chr = factor(all_histo_regions_enrich$chr, levels = c(1:22, 'X', 'Y'))
+all_histo_regions_enrich$arm = substr(unlist(lapply(strsplit(all_histo_regions_enrich$cytoband, paste(unique(paste0('chr', all_histo_regions_enrich$chr)), collapse = '|')), '[[', 2)), 0, 1)
+all_histo_regions_enrich$cytoband_pos = substr(unlist(lapply(strsplit(all_histo_regions_enrich$cytoband, 'p|q'), '[[', 2)), 0, 2)
+  
+all_histo_regions_enrich = all_histo_regions_enrich[order(all_histo_regions_enrich$tissue, all_histo_regions_enrich$chr, all_histo_regions_enrich$arm, all_histo_regions_enrich$cytoband_pos),]
+all_histo_regions_enrich$cytoband = factor(all_histo_regions_enrich$cytoband, levels = unique(all_histo_regions_enrich$cytoband))
+all_histo_regions_enrich$sig_variable = 1 / all_histo_regions_enrich$FDR #invert for plotting purposes
+
+for(i in 1:nrow(all_histo_regions_enrich)){
+  if(all_histo_regions_enrich$Direction[i] == 'Down') all_histo_regions_enrich$sig_variable[i] = -1 * all_histo_regions_enrich$sig_variable[i]
+}
+
+write.table(all_histo_regions_enrich, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/gct_cytoband_region_enrichment20210305.txt', col.names = T, row.names = F, quote = F, sep = '\t')
+
+all_histo_regions_enrich_wide <- dcast(all_histo_regions_enrich, tissue ~ cytoband, value.var="sig_variable")
+row.names(all_histo_regions_enrich_wide) = all_histo_regions_enrich_wide$tissue
+
+all_histo_regions_enrich_wide = all_histo_regions_enrich_wide[,2:297]
+all_histo_regions_enrich_wide_auto = all_histo_regions_enrich_wide[, !grepl('chrX|chrY', colnames(all_histo_regions_enrich_wide)),]
+ 
+col_fun = colorRamp2(c(-100, -10, 0, 10, 100), c('purple', '#520160', 'black', '#435E1C', '#95D840'))
+chrom_order = factor(unlist(lapply(strsplit(colnames(all_histo_regions_enrich_wide_auto), 'p|q'), '[[', 1)), levels = paste0('chr', 1:22))
+levels(chrom_order) = 1:22
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/enriched_regions_gct_expression20210305.pdf', width = 15, height = 8)
+Heatmap(all_histo_regions_enrich_wide_auto, cluster_columns = F, cluster_rows = F, col = col_fun, column_split = chrom_order, heatmap_legend_param = list(title = "FDR", at = c(-100, -10, 10, 100), labels = c(0.01, 0.1, 0.1, 0.01), legend_height = unit(4, "cm")), show_column_names = F, row_names_side = 'left', row_order = c('GCNIS', 'Dysgerminoma', 'Seminoma', 'Embryonal_carcinoma', 'Yolk_sac_tumour', 'Syncytiotrophoblasts', 'Neuroepithelium', 'Mature_glandular_teratoma', 'Other_epithelial_teratoma', 'Adipose_teratoma', 'Smooth_muscle_teratoma', 'Immature_cartilage_teratoma', 'Stroma'))
+dev.off()
+
+```
+
+#Which 12p genes are upregulated in which GCT tissues?
+
+```{r}
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de')
+
+invasive_comparison = list.files(pattern = '_normtestis_voom_de_20210304.txt')[!grepl('gcnis|invasive_gct', list.files(pattern = '_normtestis_voom_de_20210304.txt'))]
+
+raw_data = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/filtering/germ_cell_lcm_rna_preQC.txt', header = T, sep = '\t', stringsAsFactors = F) #raw count data
+row.names(raw_data) = raw_data$Geneid
+raw_data$Start = unlist(lapply(strsplit(raw_data$Start, ';'), '[[', 1))
+raw_data$Start = as.numeric(raw_data$Start)
+genes_list = row.names(raw_data[raw_data$Chr == 12 & raw_data$Start < 35800000,]) #759
+
+
+all_tissue_df = c()
+for(i in invasive_comparison){
+  tissue_file = read.table(i, header = T, sep = '\t', stringsAsFactors = F)
+  sig_up = tissue_file[tissue_file$logFC >= 2 & tissue_file$adj.P.Val < 0.01,]
+  sig_up = sig_up[row.names(sig_up) %in% genes_list,]
+  tissue_df = data.frame(row.names(sig_up), i)
+  all_tissue_df = rbind(all_tissue_df, tissue_df)
+}
+
+all_tissue_df$i = as.character(all_tissue_df$i)
+all_tissue_df$i = unlist(strsplit(all_tissue_df$i, '_normtestis_voom_de_20210304.txt'))
+all_tissue_tab = as.data.frame(table(all_tissue_df$row.names.sig_up.))
+all_tissue_tab = all_tissue_tab[order(all_tissue_tab$Freq, decreasing = T),]
+
+tf_list = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/reference_datasets/church_tfs.txt', header = F, sep = '\t', stringsAsFactors = F)[,1]
+
+all_tissue_tab$Var1 = as.character(all_tissue_tab$Var1)
+all_tissue_tab$is_tf = 'no'
+for(i in 1:nrow(all_tissue_tab)){
+  if(all_tissue_tab$Var1[i] %in% tf_list) all_tissue_tab$is_tf[i] = 'yes'
+}
+
+names(all_tissue_tab) = c('12p gene', 'No. of tissues upregulated in (/12)', 'Transcription factor')
+
+all_tissue_tab$tissues_involved = NA
+for(j in 1:nrow(all_tissue_tab)){
+  all_tissue_tab$tissues_involved[j] = paste(all_tissue_df[all_tissue_df$row.names.sig_up. == all_tissue_tab$`12p gene`[j],]$i, collapse = ', ')
+}
+
+write.table(all_tissue_tab, '/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/enriched_12p_genes/gct_tissues_enriched_for_12p_genes_20210305.txt', col.names = T, row.names = F, sep = '\t', quote = F)
+
+```
+
+
+#Limma-Voom DE analysis between different all invasive GCT tissues together and normal testis for chromosome 12p composite plot
+
+
+```{r}
+
+library(limma)
+library(edgeR)
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/pre_processing')
+
+raw_data = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/filtering/germ_cell_lcm_rna_preQC.txt', header = T, sep = '\t', stringsAsFactors = F) #raw count data
+metadata = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_RNA_metadata.txt', header = T, sep = '\t', stringsAsFactors = F) #read in metadata for filtered, final cuts
+row.names(metadata) = metadata$Sample_ID
+gct_mat = raw_data[, 7:ncol(raw_data)]
+row.names(gct_mat) = raw_data$Geneid
+
+#remove cuts that failed QC
+gct_mat = gct_mat[, colnames(gct_mat) %in% metadata[metadata$Updated.Description != 'GCNIS',]$Sample_ID] #382 samples after removing GCNIS
+
+#define factors that will be input into the model
+histology = factor(metadata[colnames(gct_mat), ]$Updated.Description)
+tumour = factor(metadata[colnames(gct_mat), ]$Normal.Tumour)
+metadata = metadata[colnames(gct_mat),]
+
+#preprocessing
+y <- DGEList(counts = gct_mat, group = tumour)
+keep <- filterByExpr(y, group = tumour)
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y) #12431 genes kept
+y <- estimateCommonDisp(y) #to generate pseudocounts, adjusted for library size
+
+#visualise if microbiopsies from the same histology cluster and if there is patient effect
+plotMDS(y, labels = tumour, col = as.numeric(histology))
+
+#specify model to be fitted, no intercept to be fitted, each normal-tumour status will have its own group mean
+design = model.matrix(~ 0 + tumour)
+colnames(design) = levels(tumour)
+
+#run double voom to optimise regression weights, adjust for histology as 'block' to find underlying generic tumour signal
+v <- voom(y, design)
+corfit <- duplicateCorrelation(v, design, block = histology)
+v <- voom(y, design, block = histology, correlation = corfit$consensus)
+corfit <- duplicateCorrelation(v, design, block = histology)
+fit <- lmFit(v, design, block = histology, correlation = corfit$consensus)
+corfit$consensus #0.1980107
+
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de')
+
+saveRDS(v, 'LCM_invasive_GCT_v_testis_DE_voom_object_20210305.RDS')
+saveRDS(fit, 'LCM_invasive_GCT_v_testis_DE_model_fit_20210305.RDS')
+
+v = readRDS('LCM_invasive_GCT_v_testis_DE_voom_object_20210305.RDS')
+fit = readRDS('LCM_invasive_GCT_v_testis_DE_model_fit_20210305.RDS')
+
+cont_matrix = makeContrasts(Tumour - Normal, levels = colnames(coef(fit)))
+fit2 <- contrasts.fit(fit, cont_matrix)
+fit2 <- eBayes(fit2)
+top.table <- topTable(fit2, number = nrow(fit$coefficients), sort.by = "P")
+
+raw_data = read.table("/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/filtering/germ_cell_lcm_rna_preQC.txt", header = T, sep = '\t', stringsAsFactors = F, check.names = T)
+row.names(raw_data) = raw_data$Geneid
+raw_data$Start = unlist(lapply(strsplit(raw_data$Start, ';'), '[[', 1))
+
+top.table$chr = raw_data[row.names(top.table),]$Chr
+top.table$start = raw_data[row.names(top.table),]$Start
+top.table$start = as.numeric(top.table$start)
+
+write.table(top.table, 'invasive_gct_v_normtestis_voom_de_20210304.txt', col.names = T, sep = '\t', row.names = T, quote = F)
+
+```
+
+##Plot
+
+```{r}
+
+#fetch cn data from Fig. 1
+
+cn_df = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/lcm_gct_cn_10000_bp_bin_per_GCT_WG_median_extra_cols.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+#limit to chromosome 12 (cumulative coordinates from 10kb bins in file)
+
+lcm_chr12_df = cn_df[(cn_df$start > 1950970000) & (cn_df$end <= 2084830000), ]
+lcm_chr12_df$chr = 'chr12'
+lcm_chr12_df$start = lcm_chr12_df$start - 1950970000
+lcm_chr12_df$end = lcm_chr12_df$end - 1950970000
+lcm_chr12_df = lcm_chr12_df[!is.na(lcm_chr12_df$all_samples),]
+
+#fetch logFC data from invasive v normal comparison
+
+top.table.lcm = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de/invasive_gct_v_normtestis_voom_de_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+#limit to chromsome 12 data for plotting
+lcm_chr12_exp_data = top.table.lcm[top.table.lcm$chr == 12,]
+lcm_chr12_exp_data$chr = paste0('chr', lcm_chr12_exp_data$chr)
+lcm_chr12_exp_data = lcm_chr12_exp_data[order(lcm_chr12_exp_data$start),]
+
+library(karyoploteR)
+library(zoo)
+
+#generic plotting settings
+chromosomes = 'chr12'
+dna_r0 <- 0.9
+dna_r1 <- 0
+rna_r0 <- 0
+rna_r1 <- 0.9
+karyoplotr_plottype = 1
+
+#in-house rna.data
+window_size = 50 #must be an even number
+y_data = rollmean(lcm_chr12_exp_data$logFC, k = window_size, align = 'center')
+x_data = lcm_chr12_exp_data$start[(window_size / 2):(length(lcm_chr12_exp_data$start) - (window_size / 2))]
+pos_y_data = ifelse(y_data > 0, y_data, 0) 
+neg_y_data = ifelse(y_data < 0, y_data, 0)
+
+##plot in-house data
+title = 'In-house'
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/gct_cn_v_exp_karyoplotter_20210305.pdf', height = 6, width = 6, useDingbats = F)
+kp <- karyoploteR::plotKaryotype(genome = "hg19", chromosomes = 'chr12', plot.type = karyoplotr_plottype, cex = 0.85, main = gsub(".*__", "", title))
+karyoploteR::kpDataBackground(kp, r0 = dna_r0, r1 = dna_r1, col = 'grey90')
+karyoploteR::kpAxis(karyoplot = kp, col = "black", ymin = -1.5, ymax = 1.5, r0 = rna_r0, r1 = rna_r1, cex = 1, tick.pos = c(-1.5, -1, -0.5, 0, 0.5, 1, 1.5), side = 2)
+karyoploteR::kpBars(kp, chr = 'chr12', x0 = x_data - 100000, x1 = x_data + 100000, y0 = 0, y1 = pos_y_data, col = '#95D840', data.panel = 1, ymin = -1.5, ymax = 1.5, r0 = rna_r0, r1 = rna_r1, clipping = T, border = 'NA')
+karyoploteR::kpBars(kp, chr = 'chr12', x0 = x_data - 100000, x1 = x_data + 100000, y0 = 0, y1 = neg_y_data, col = '#A020F0', data.panel = 1, ymin = -1.5, ymax = 1.5, r0 = rna_r0, r1 = rna_r1, clipping = T, border = 'NA')
+karyoploteR::kpAxis(karyoplot = kp, col = "black", ymin = 6, ymax = -3, r1 = dna_r1, r0 = dna_r0, cex = 1, tick.pos = c(-3, 0, 3, 6), side = 1)
+karyoploteR::kpPoints(kp, chr = lcm_chr12_df$chr, x = lcm_chr12_df$start, y = lcm_chr12_df$all_samples, col = "black", ymin = 6, ymax = -3, r0 = dna_r0, r1 = dna_r1, clipping = T) #reintroduced prepubertal samples
+dev.off()
+```
+
+#12p gene enrichment compared to regions of near baseline ploidy
+
+```{r}
+
+#fetch cn data from Fig. 1
+
+cn_df = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/combined_CN_RNA_exp/lcm_gct_cn_10000_bp_bin_per_GCT_WG_median_extra_cols.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+#limit to chromosome 12 (cumulative coordinates from 10kb bins in file)
+
+lcm_chr12_df = cn_df[(cn_df$start > 1950970000) & (cn_df$end <= 2084830000), ]
+lcm_chr12_df$chr = 'chr12'
+lcm_chr12_df$start = lcm_chr12_df$start - 1950970000
+lcm_chr12_df$end = lcm_chr12_df$end - 1950970000
+lcm_chr12_df = lcm_chr12_df[!is.na(lcm_chr12_df$all_samples),]
+
+#fetch logFC data from invasive v normal comparison
+
+top.table.lcm = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/limma_voom_de/invasive_gct_v_normtestis_voom_de_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+top.table.lcm = top.table.lcm[top.table.lcm$chr %in% c(1:22),] #only performed copy number plotting across autosomal genome for comparison
+
+#limit to chromsome 12 data for plotting
+lcm_chr12_exp_data = top.table.lcm[top.table.lcm$chr == 12,]
+lcm_chr12_exp_data$chr = paste0('chr', lcm_chr12_exp_data$chr)
+lcm_chr12_exp_data = lcm_chr12_exp_data[order(lcm_chr12_exp_data$start),]
+
+
+#get regions with a CN-ploidy within 0.5 of the overall ploidy located outside of chr12
+av_cn = cn_df[!(is.na(cn_df$all_samples)) & (cn_df$all_samples > -0.5) & (cn_df$all_samples < 0.5) & ((cn_df$start < 1950970000) | (cn_df$start > 2084830000)),]
+
+#provided cumulative loci for genes
+top.table.lcm$mod_start = top.table.lcm$start
+for(k in 1:nrow(top.table.lcm)) {
+    if(top.table.lcm$chr[k] != "1"){
+        top.table.lcm$mod_start[k] = top.table.lcm$start[k] + chrom_sizes$prior_wg_length[which(chrom_sizes$chr == top.table.lcm$chr[k])]
+      }
+}
+
+top.table.lcm$av_cn_region = NA
+
+for(i in 1:nrow(top.table.lcm)){
+  if(nrow(av_cn[(av_cn$start < top.table.lcm$mod_start[i]) & (av_cn$end > top.table.lcm$mod_start[i]), ]) > 0){
+    top.table.lcm$av_cn_region[i] = 'Yes'
+  }
+  if(nrow(av_cn[(av_cn$start < top.table.lcm$mod_start[i]) & (av_cn$end > top.table.lcm$mod_start[i]), ]) == 0){
+    top.table.lcm$av_cn_region[i] = 'No'
+  }
+}
+
+n_12p_genes = nrow(top.table.lcm[top.table.lcm$chr == 12 & top.table.lcm$start < 35800000,]) #226 used
+mean_12p = mean(top.table.lcm[top.table.lcm$chr == 12 & top.table.lcm$start < 35800000,]$logFC) # 0.686984
+
+nRand = 100000
+randScores=c()
+set.seed(42)
+av_cn_exp_regions = top.table.lcm[top.table.lcm$av_cn_region == 'Yes',]
+
+for(i in 1:nRand){
+  randScores=c(randScores, mean(sample(av_cn_exp_regions$logFC, n_12p_genes, replace = F)))
+}
+
+pVal = sum(randScores >= mean_12p)/nRand #0...
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/rand_sampling_gene_exp_v_12p_20210305.pdf', height = 3, width = 4)
+ggplot() + geom_density(mapping = aes(x = randScores), fill = '#999999') + xlim(-2, 1) + theme_pubr() + geom_vline(xintercept = mean_12p) + labs(x = 'log2FC of gene expression in regions with baseline ploidy') + coord_cartesian(expand = F)
+dev.off()
+
+```
+
+#Sample proximity scores
+##Genomic
+
+```{r}
+
+library(ggplot2)
+library(ggpubr)
+library(ggbeeswarm)
+
+dna_cuts = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_DNA_supplementary_data.txt', header = T, sep = '\t', stringsAsFactors = F)
+
+mixed_feature_cuts = dna_cuts[dna_cuts$Histology != 'GCNIS' & dna_cuts$Diagnosis == 'Post-pubertal mixed germ cell tumour',]
+
+pluri_mixed_feature_cuts = mixed_feature_cuts[!mixed_feature_cuts$Case_ID %in% c('PD45545', 'PD46966', 'PD46969'),] #only one histology in these tumours represented or multiple but spread a thinly across multiple biopsies unevenly which would distort a genetic proximity score
+
+#between histologies
+interhisto_g_list = list()
+for(i in unique(pluri_mixed_feature_cuts$Case_ID)){ #per patient
+  assessed_histo = c() #record of histologies already analysed
+  g_prox_score_vec = c() #vector of per patient comparison scores
+  for(j in unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i,]$Histology)){ #per histology
+    assessed_histo = c(assessed_histo, j) #add histology to list not to compare against
+    if(j != unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i,]$Histology)[length(unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i,]$Histology))]){ #no groups left for the final histology to be compared against
+        for(k in unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i & pluri_mixed_feature_cuts$Histology == j,]$Sample)){ #each patient sample per histology
+      choice_sample = read.table(paste0('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/final_variant_calls/SNV/', k, '_post_swater_final_snvs.txt'), header = T, sep = '\t', stringsAsFactors = F)
+      choice_sample = choice_sample[choice_sample$VAF >= 0.1,] #remove low level contamination from other histologies
+      for(l in unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i & !(pluri_mixed_feature_cuts$Histology %in% assessed_histo),]$Sample)){
+        comparator_sample = read.table(paste0('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/final_variant_calls/SNV/', l, '_post_swater_final_snvs.txt'), header = T, sep = '\t', stringsAsFactors = F)
+        comparator_sample = comparator_sample[comparator_sample$VAF >= 0.1,] #remove low level contamination from other histologies
+        g_prox = length(intersect(choice_sample$ID, comparator_sample$ID)) / ((nrow(choice_sample) + nrow(comparator_sample)) / 2) #average sharedness of high VAF mutations
+        g_prox_score_vec = c(g_prox_score_vec, g_prox) #add pairwise comparison to patient vector
+      }
+    }
+    }
+  }
+  interhisto_g_list = c(interhisto_g_list, list(g_prox_score_vec))
+}
+
+names(interhisto_g_list) = unique(pluri_mixed_feature_cuts$Case_ID)
+sapply(interhisto_g_list, median)
+
+#within histologies
+intrahisto_g_list = list()
+for(i in unique(pluri_mixed_feature_cuts$Case_ID)){ #per patient
+  g_prox_score_vec = c() #vector of per patient comparison scores
+  for(j in unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i,]$Histology)){ #per histology
+    if(nrow(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i & pluri_mixed_feature_cuts$Histology == j,]) > 1){ #if histology has more than one microbiopsy
+      assessed_samples = c() #record of samples already analysed
+      for(k in unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i & pluri_mixed_feature_cuts$Histology == j,]$Sample)){ #per sample
+        assessed_samples = c(assessed_samples, k) #add to vector of analysed samples
+        choice_sample = read.table(paste0('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/final_variant_calls/SNV/', k, '_post_swater_final_snvs.txt'), header = T, sep = '\t', stringsAsFactors = F)
+        choice_sample = choice_sample[choice_sample$VAF >= 0.1,] #remove low level contamination from other histologies
+        if(k != unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i & pluri_mixed_feature_cuts$Histology == j,]$Sample)[length(unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i & pluri_mixed_feature_cuts$Histology == j,]$Sample))]){ #as the last sample cannot be compared against itself
+          for(l in unique(pluri_mixed_feature_cuts[pluri_mixed_feature_cuts$Case_ID == i & pluri_mixed_feature_cuts$Histology == j & !(pluri_mixed_feature_cuts$Sample %in% assessed_samples),]$Sample)){
+          comparator_sample = read.table(paste0('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/final_variant_calls/SNV/', l, '_post_swater_final_snvs.txt'), header = T, sep = '\t', stringsAsFactors = F)
+          comparator_sample = comparator_sample[comparator_sample$VAF >= 0.1,] #remove low level contamination from other histologies
+        g_prox = length(intersect(choice_sample$ID, comparator_sample$ID)) / ((nrow(choice_sample) + nrow(comparator_sample)) / 2) #average sharedness of high VAF mutations
+        g_prox_score_vec = c(g_prox_score_vec, g_prox) #add pairwise comparison to patient vector
+        }
+        }
+        
+      }
+    }
+  }
+  intrahisto_g_list = c(intrahisto_g_list, list(g_prox_score_vec))
+}
+
+names(intrahisto_g_list) = unique(pluri_mixed_feature_cuts$Case_ID)
+sapply(intrahisto_g_list, median)
+
+#combine results
+interhisto_g_df = data.frame(unlist(interhisto_g_list))
+interhisto_g_df$patient = substr(row.names(interhisto_g_df), 0, 7)
+interhisto_g_df$comparison = 'Inter-histology'
+row.names(interhisto_g_df) = NULL
+colnames(interhisto_g_df) = c('gen_prox', 'patient', 'comparison')
+
+intrahisto_g_df = data.frame(unlist(intrahisto_g_list))
+intrahisto_g_df$patient = substr(row.names(intrahisto_g_df), 0, 7)
+intrahisto_g_df$comparison = 'Intra-histology'
+row.names(intrahisto_g_df) = NULL
+colnames(intrahisto_g_df) = c('gen_prox', 'patient', 'comparison')
+
+all_histo_g_df = rbind(interhisto_g_df, intrahisto_g_df)
+all_histo_g_df$comparison = factor(all_histo_g_df$comparison, levels = c('Intra-histology', 'Inter-histology'))
+all_histo_g_df$patient = as.factor(all_histo_g_df$patient)
+
+#are these differences significant? no
+PD43296_g = wilcox.test(gen_prox ~ comparison, all_histo_g_df[all_histo_g_df$patient == 'PD43296',]) #W = 24522, p-value = 0.1284
+PD43298_g = wilcox.test(gen_prox ~ comparison, all_histo_g_df[all_histo_g_df$patient == 'PD43298',]) #W = 12651, p-value = 0.8893
+PD45543_g = wilcox.test(gen_prox ~ comparison, all_histo_g_df[all_histo_g_df$patient == 'PD45543',]) #W = 4, p-value = 1
+PD45544_g = wilcox.test(gen_prox ~ comparison, all_histo_g_df[all_histo_g_df$patient == 'PD45544',]) #W = 151, p-value = 0.4753
+PD46269_g = wilcox.test(gen_prox ~ comparison, all_histo_g_df[all_histo_g_df$patient == 'PD46269',]) #W = 145, p-value = 0.6483
+
+#adjust for multiple testing
+p_g_vec = c(PD43296_g$p.value, PD43298_g$p.value, PD45543_g$p.value, PD45544_g$p.value, PD46269_g$p.value) 
+p.adj_g_vec = p.adjust(p_g_vec, method="BH")
+names(p.adj_g_vec) = unique(pluri_mixed_feature_cuts$Case_ID)
+
+ggplot(all_histo_g_df) + 
+  geom_quasirandom(mapping = aes(x = gen_prox, y = comparison, col = comparison), width = 0.3, groupOnX = F) +
+  geom_pointrange(mapping = aes(x = gen_prox, y = comparison), stat = "summary", 
+                  shape=19, 
+                  fun.min = function(z) {quantile(z,0.25)},
+                  fun.max = function(z) {quantile(z,0.75)},
+                  fun = median, fill="black") +
+  facet_grid(patient ~ ., scales = 'free_y', space = 'free_y') + theme_pubr() + theme(axis.text.y = element_blank(), panel.spacing = unit(0, 'mm'), strip.background = element_blank(), strip.placement = "outside", strip.text = element_text(size = 11)) + xlab('Genetic similarity') + ylab ('') + scale_y_discrete(position = "right")  + scale_x_continuous(expand = c(0,0), limits = c(0,1))
+
+p1 = ggplot(all_histo_g_df) + 
+  geom_boxplot(mapping = aes(x = gen_prox, y = comparison, fill = comparison), width = 0.5) +
+  facet_grid(patient ~ ., scales = 'free_y', space = 'free_y') + theme_pubr() + theme(axis.text.y = element_blank(), panel.spacing = unit(0, 'mm'), strip.background = element_blank(), strip.placement = "outside", strip.text = element_text(size = 11)) + xlab('Genetic similarity') + ylab ('') + scale_y_discrete(position = "right")  + scale_x_continuous(expand = c(0,0), limits = c(0,1)) + scale_fill_manual(values = c('#F8766D', '#00BFC4'), name = 'Comparison')
+
+```
+
+##Transcriptomic
+
+```{r}
+
+#libraries to use
+#library(lsa)
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(ggbeeswarm)
+
+#genes to remove to leave ones of more biological interest to compare
+source('/lustre/scratch119/casm/team294rr/to3/testes/tumour/RNA_analysis/geneSets.R')
+prot_cod = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/RNA_analysis/protein_coding_genes.txt', header = F, sep='\t', stringsAsFactors = F)[,1]
+
+#read in data
+tpm = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/analyses/RNA/pre_processing/tmm_norm_gct_tpm_20210304.txt', header = T, sep = '\t', stringsAsFactors = F)
+log2tpm <- log2(as.matrix(tpm) + 1)
+log2tpm = log2tpm[(row.names(log2tpm) %in% prot_cod) & !(row.names(log2tpm) %in% unique(c(hgGenes, hkGenes, igGenes, riboGenes, riboRNAGenes, cc.genes.updated.2019$s.genes, cc.genes.updated.2019$g2m.genes))),]
+metadata = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/supplementary_data/GCT_RNA_metadata.txt', header = T, sep = '\t', stringsAsFactors = F)
+row.names(metadata) = metadata$Sample_ID
+inv_mixed_rna = metadata[metadata$Diagnosis == 'Post-pubertal mixed germ cell tumour' & metadata$Normal.Tumour == 'Tumour' & metadata$Updated.Description != 'GCNIS',]
+inv_mixed_rna = inv_mixed_rna[inv_mixed_rna$Case_ID %in% c('PD43296', 'PD43298', 'PD45543', 'PD45544', 'PD46269'),] #make direct contrast in each tumour to their transcriptome
+
+#between histologies
+interhisto_t_list = list()
+for(i in unique(inv_mixed_rna$Case_ID)){ #per patient
+  assessed_histo = c() #record of histologies already analysed
+  t_prox_score_vec = c() #vector per patient comparison scores
+  for(j in unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i,]$Updated.Description)){
+    assessed_histo = c(assessed_histo, j) #add histology to list to not compare against
+    if(length(assessed_histo) != length(unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i,]$Updated.Description))){ #stop when you are at the last histology as you have already compared it to all of the others
+       for(k in unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i & inv_mixed_rna$Updated.Description == j,]$Sample_ID)){ #samples per histology per tumour
+      choice_sample = log2tpm[, k] #vector from sample in histology of interest
+      for(l in unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i & !(inv_mixed_rna$Updated.Description %in% assessed_histo),]$Sample_ID)){
+        comparator_sample = log2tpm[, l] #vector from a sample in another histology
+        t_prox = cor(choice_sample, comparator_sample, method = 'pearson')
+        t_prox_score_vec = c(t_prox_score_vec, t_prox)
+    }
+    }
+    }
+   
+  }
+  interhisto_t_list = c(interhisto_t_list, list(t_prox_score_vec))
+}
+
+names(interhisto_t_list) = unique(inv_mixed_rna$Case_ID)
+
+sapply(interhisto_t_list, median)
+
+#within histologies
+intrahisto_t_list = list()
+for(i in unique(inv_mixed_rna$Case_ID)){ #per patient
+  t_prox_score_vec = c() #vector per patient comparison scores
+  for(j in unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i,]$Updated.Description)){ #per histology
+      if(nrow(inv_mixed_rna[inv_mixed_rna$Case_ID == i & inv_mixed_rna$Updated.Description == j,]) > 1){ #if histology has more than one microbiopsy
+      assessed_samples = c() #record of samples already analysed
+      for(k in unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i & inv_mixed_rna$Updated.Description == j,]$Sample)){ #per sample
+        assessed_samples = c(assessed_samples, k) #add to vector analysed
+        choice_sample = log2tpm[, k]
+        
+        if(k != unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i & inv_mixed_rna$Updated.Description == j,]$Sample)[length(unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i & inv_mixed_rna$Updated.Description == j,]$Sample))]){ #so the last sample isn't compared against itself
+          for(l in unique(inv_mixed_rna[inv_mixed_rna$Case_ID == i & inv_mixed_rna$Updated.Description == j & !(inv_mixed_rna$Sample %in% assessed_samples),]$Sample)){
+          comparator_sample = log2tpm[, l]
+          t_prox = cor(choice_sample, comparator_sample, method = 'pearson')
+          t_prox_score_vec = c(t_prox_score_vec, t_prox)
+        }
+        }
+      }
+    }
+  }
+  intrahisto_t_list = c(intrahisto_t_list, list(t_prox_score_vec))
+}
+
+names(intrahisto_t_list) = unique(inv_mixed_rna$Case_ID)
+sapply(intrahisto_t_list, median)
+
+#control - against normal testis
+norm_control = metadata[metadata$Normal.Tumour == 'Normal',]
+
+norm_tumour_t_list = list()
+for(i in unique(inv_mixed_rna$Case_ID)){ #per patient
+  t_prox_score_vec = c() #vector per patient comparison scores
+  for(j in inv_mixed_rna[inv_mixed_rna$Case_ID == i,]$Sample_ID){
+    choice_sample = log2tpm[, j]
+    for(k in norm_control$Sample_ID){
+      comparator_sample = log2tpm[, k]
+      t_prox = cor(choice_sample, comparator_sample, method = 'pearson')
+      #t_prox = cosine(choice_sample, comparator_sample)[1,1]
+      #t_prox = cor(choice_sample, comparator_sample, method = 'spearman')
+      t_prox_score_vec = c(t_prox_score_vec, t_prox)
+    }
+  }
+  norm_tumour_t_list = c(norm_tumour_t_list, list(t_prox_score_vec))
+}
+
+names(norm_tumour_t_list) = unique(inv_mixed_rna$Case_ID)
+
+sapply(norm_tumour_t_list, median)
+
+#add together
+interhisto_t_df = data.frame(unlist(interhisto_t_list))
+interhisto_t_df$patient = substr(row.names(interhisto_t_df), 0, 7)
+interhisto_t_df$comparison = 'Inter-histology'
+row.names(interhisto_t_df) = NULL
+colnames(interhisto_t_df) = c('t_prox', 'patient', 'comparison')
+
+intrahisto_t_df = data.frame(unlist(intrahisto_t_list))
+intrahisto_t_df$patient = substr(row.names(intrahisto_t_df), 0, 7)
+intrahisto_t_df$comparison = 'Intra-histology'
+row.names(intrahisto_t_df) = NULL
+colnames(intrahisto_t_df) = c('t_prox', 'patient', 'comparison')
+
+norm_tumour_t_df = data.frame(unlist(norm_tumour_t_list))
+norm_tumour_t_df$patient = substr(row.names(norm_tumour_t_df), 0, 7)
+norm_tumour_t_df$comparison = 'Normal v Tumour'
+row.names(norm_tumour_t_df) = NULL
+colnames(norm_tumour_t_df) = c('t_prox', 'patient', 'comparison')
+
+all_histo_t_df = rbind(interhisto_t_df, intrahisto_t_df, norm_tumour_t_df)
+
+ggplot(all_histo_t_df) + 
+  geom_quasirandom(mapping = aes(x = comparison, y = t_prox, col = comparison), width = 0.3) +
+  geom_pointrange(mapping = aes(x = comparison, y = t_prox), stat = "summary", 
+                  shape=19, 
+                  fun.min = function(z) {quantile(z,0.25)},
+                  fun.max = function(z) {quantile(z,0.75)},
+                  fun = median, fill="black") +
+  facet_grid(. ~ patient, scales = 'free_x', space = 'free_x', switch = 'x') + theme_pubr() + theme(axis.text.x = element_blank(), panel.spacing = unit(0, 'mm'), strip.background = element_blank(), strip.placement = "outside", strip.text = element_text(size = 11)) + ylab('Transcriptomic similarity') + xlab ('') + ylim(0, 1)
+
+PD43296_t = wilcox.test(t_prox ~ comparison, all_histo_t_df[all_histo_t_df$patient == 'PD43296' & all_histo_t_df$comparison %in% c('Inter-histology', 'Intra-histology'),]) #W = 117762, p-value < 2.2e-16
+PD43298_t = wilcox.test(t_prox ~ comparison, all_histo_t_df[all_histo_t_df$patient == 'PD43298' & all_histo_t_df$comparison %in% c('Inter-histology', 'Intra-histology'),]) #W = 51363, p-value < 2.2e-16
+PD45543_t = wilcox.test(t_prox ~ comparison, all_histo_t_df[all_histo_t_df$patient == 'PD45543' & all_histo_t_df$comparison %in% c('Inter-histology', 'Intra-histology'),]) #W = 7, p-value = 0.01399
+PD45544_t = wilcox.test(t_prox ~ comparison, all_histo_t_df[all_histo_t_df$patient == 'PD45544' & all_histo_t_df$comparison %in% c('Inter-histology', 'Intra-histology'),]) #W = 3492, p-value < 2.2e-16
+PD46269_t = wilcox.test(t_prox ~ comparison, all_histo_t_df[all_histo_t_df$patient == 'PD46269' & all_histo_t_df$comparison %in% c('Inter-histology', 'Intra-histology'),]) #W = 15259, p-value < 2.2e-16
+
+p_t_vec = c(PD43296_t$p.value, PD43298_t$p.value, PD45543_t$p.value, PD45544_t$p.value, PD46269_t$p.value) 
+p.adj_t_vec = p.adjust(p_t_vec, method="BH")
+names(p.adj_t_vec) = unique(inv_mixed_rna$Case_ID)
+
+all_histo_t_df$comparison = factor(all_histo_t_df$comparison, levels = c('Intra-histology', 'Inter-histology', 'Normal v Tumour'))
+
+```
+
+##Plot
+```{r}
+
+library(cowplot)
+
+p1 = ggplot(all_histo_g_df) + 
+  geom_quasirandom(mapping = aes(x = gen_prox, y = comparison, col = comparison), width = 0.3, groupOnX = F) +
+  geom_pointrange(mapping = aes(x = gen_prox, y = comparison),
+                  stat = "summary", shape=19, 
+                  fun.min = function(z) {quantile(z,0.25)},
+                  fun.max = function(z) {quantile(z,0.75)},
+                  fun = median, fill = "black") +
+  facet_grid(patient ~ ., scales = 'free_y', space = 'free_y') + theme_pubr() + theme(axis.text.y = element_blank(), panel.spacing = unit(0, 'mm'), strip.background = element_blank(), strip.placement = "none", strip.text = element_text(size = 11)) + xlab('Genetic similarity') + ylab ('') + scale_y_discrete(position = "right")  + scale_x_continuous(expand = c(0,0), limits = c(0,1)) + scale_color_manual(values = c("#F2AD00", "#5BBCD6"), name = 'Comparison')
+
+p2 = ggplot(all_histo_t_df) + 
+  geom_quasirandom(mapping = aes(x = t_prox, y = comparison, col = comparison), width = 0.4, groupOnX = F) +
+  geom_pointrange(mapping = aes(x = t_prox, y = comparison),
+                  stat = "summary", shape=19, 
+                  fun.min = function(z) {quantile(z,0.25)},
+                  fun.max = function(z) {quantile(z,0.75)},
+                  fun = median, fill = "black") +
+  facet_grid(patient ~ ., scales = 'free_y', space = 'free_y', switch = 'y') + theme_pubr() + theme(axis.text.y = element_blank(), panel.spacing = unit(0, 'mm'), strip.background = element_blank(), strip.placement = "outside", strip.text = element_text(size = 11)) + xlab('Transcriptomic similarity') + ylab ('') + scale_y_discrete(position = "left")  + scale_x_reverse(expand = c(0,0), limits = c(1,0)) + scale_color_manual(values = c("#F2AD00", "#5BBCD6", '#999999'), name = 'Comparison')
+
+pdf('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/figures/gct_genetic_proximity_pearson_rna_20210305.pdf', height = 6, width = 8, useDingbats = F)
+plot_grid(p1, p2, align = 'h', ncol = 2)
+dev.off()
+
+```
