@@ -4,10 +4,10 @@ source('/lustre/scratch119/casm/team294rr/to3/testes/tumour/RNA_analysis/geneSet
 prot_cod = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/RNA_analysis/protein_coding_genes.txt', header = F, sep='\t', stringsAsFactors = F)[,1]
 
 #read in data
-tpm = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nature_resub/supplementary_data/germ_cell_lcm_tpm_counts_filtered_samples_20210812.txt', header = T, sep = '\t', stringsAsFactors = F)
+tpm = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nat_comms_2022_R0/00_SUPPLEMENTARY_DATA/germ_cell_lcm_tpm_counts_filtered_samples_20210812.txt', header = T, sep = '\t', stringsAsFactors = F)
 log2tpm <- log2(as.matrix(tpm) + 1)
 log2tpm = log2tpm[(row.names(log2tpm) %in% prot_cod) & !(row.names(log2tpm) %in% unique(c(hgGenes, hkGenes, igGenes, cc.genes.updated.2019$s.genes, cc.genes.updated.2019$g2m.genes))),] #remove genes whose expression will be related to normal contamination or cellular functions not related to phenotype
-metadata = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nature_resub/supplementary_data/mRNA_summary_metadata.txt', sep = '\t', header = T, stringsAsFactors = F, quote = '')
+metadata = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nat_comms_2022_R0/00_SUPPLEMENTARY_DATA/mRNA_summary_metadata.txt', sep = '\t', header = T, stringsAsFactors = F, quote = '')
 row.names(metadata) = metadata$Sample
 inv_mixed_rna = metadata[metadata$Diagnosis == 'Post-pubertal mixed germ cell tumour' & metadata$Normal.Tumour == 'Tumour' & metadata$Updated.Description != 'GCNIS',]
 inv_mixed_rna = inv_mixed_rna[inv_mixed_rna$Case.ID %in% c('PD43296', 'PD43298', 'PD45543', 'PD45544', 'PD46269'),] #make direct contrast in each tumour to their transcriptome
@@ -159,7 +159,7 @@ for(i in patient){
 }
 
 # patient observed_median_diff  pval
-# PD45543           0.08906052 0.008
+# PD45543           0.08906052 0.015
 # PD43296           0.05536096 0.000
 # PD43298           0.12263423 0.000
 # PD45544           0.17752213 0.000

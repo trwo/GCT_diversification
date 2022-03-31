@@ -1,16 +1,16 @@
 
-setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nature_resub/supplementary_data/')
+setwd('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nat_comms_2022_R1/05_COMBINED_DNA_RNA_ANALYSES/genomic/')
 
-patient = c("PD43296", "PD43298", "PD45544", "PD46269") #copy over relevant files
-for(i in patient){
-  system(paste0('cp /lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nature_resub/multidimdpclust_noX_new_swater/01_Input/', i, '/md_out/', i, '_filtered_clusters_median_CCF.txt .'))
-}
+#patient = c("PD43296", "PD43298", "PD45544", "PD46269") #copy over relevant files
+#for(i in patient){
+system(paste0('cp /lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nat_comms_2022_R1/03_DNA_ANALYSES/phylogeny/ndDPClust/', i, '_filtered_clusters_mean_CCF.txt .'))
+#}
 
-system('cp /lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nature_resub/upto5_dpclust_noX_new_swater/03_Output/PD45543_DPoutput_3000iters_1000burnin_seed123/PD45543_3000iters_1000burnin_bestClusterInfo.txt .') #changed headers and name to match other files 27.9.21
+system('cp /lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nat_comms_2022_R0/03_DNA_ANALYSES/phylogeny/DPClust/PD45543_3000iters_1000burnin_bestClusterInfo.txt .') #changed headers and name to match other files 16.3.22
 
 patient = c("PD43296", "PD43298", "PD45543", "PD45544", "PD46269") #only mixed tumours with multiple histologies represented within each biopsy taken
 
-ignore_clusters = list(PD43296 = c(15, 7, 8), PD43298 = c(5, 6, 8), PD45543 = c(NULL), PD45544 = c(3), PD46269 = c(2)) #low VAF/artefactual clusters that shouldn't be included in similarity metric
+ignore_clusters = list(PD43296 = c(12), PD43298 = c(NULL), PD45543 = c(NULL), PD45544 = c(3), PD46269 = c(2, 3)) #low VAF/artefactual clusters that shouldn't be included in similarity metric
 
 manifest = read.table('/lustre/scratch119/casm/team294rr/to3/testes/tumour/manuscript/nature_resub/supplementary_data/WGS_summary_metadata.txt', header = T, sep = '\t', stringsAsFactors = F)
 
@@ -174,7 +174,7 @@ for(i in patient){
 
 #patient observed_median_diff      pval
 #PD45543          0.036548715 0.4285714
-#PD43296          0.000000000 1.0000000
-#PD43298          0.008784081 0.3270000
-#PD45544          0.006219076 0.2780000
-#PD46269          0.062893469 0.0020000
+#PD43296          0.010493501 0.3550000
+#PD43298          0.004696293 0.7200000
+#PD45544          0.010150518 0.2570000
+#PD46269          0.075844487 0.0000000
