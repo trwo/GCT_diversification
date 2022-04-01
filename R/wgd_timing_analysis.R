@@ -367,15 +367,18 @@ for(i in 1:nrow(predup_burden_df_per_patient)){
   predup_burden_df_per_patient$site[i] = pt_ages[pt_ages$Case.ID == predup_burden_df_per_patient$patient[i],]$Organ
 }
 
-predup_burden_df_per_patient$estimated_postPGC_cell_divisions = predup_burden_df_per_patient$adj_genome_sub_burden / 0.6 #middle of range for estimated subs per cell division
+#Rahbari et al 2016 report 0.5-0.7 mutations per haploid genome per cell division. We can, therefore, extrapolate to 1-1.4 mutations per diploid genome per cell division (the assumed diploid PGC precursor to postpubertal GCTs)
+#this is interpreted as 1.2 +/- 0.2
+#assuming no uncertainty for the pre-duplication substitution burden
+#Number of cell division prior to WGD (f) = Pre-WGD sub burden (A) / Estimated subs per diploid genome per cell division post-PGC specification (B)
+#sig_f = f * (sig_B / B) where B = 1.2 and sig_B = 0.2
+
+predup_burden_df_per_patient$estimated_postPGC_cell_divisions = predup_burden_df_per_patient$adj_genome_sub_burden / 1.2 #estimated subs per diploid genome per cell division post PGC specification
 
 #take estimate of postPGC mutation rate per cell division in testis and ovary from Rahbari et al. 2016
-predup_burden_df_per_patient$estimated_postPGC_cell_divisions_upper = predup_burden_df_per_patient$adj_genome_sub_burden / 0.5
-predup_burden_df_per_patient$estimated_postPGC_cell_divisions_lower = predup_burden_df_per_patient$adj_genome_sub_burden / 0.7
+predup_burden_df_per_patient$estimated_postPGC_cell_divisions_err = predup_burden_df_per_patient$estimated_postPGC_cell_divisions * (0.2 / 1.2)
 
-median(predup_burden_df_per_patient[predup_burden_df_per_patient$age > 12,]$estimated_postPGC_cell_divisions) #9.613504
-median(predup_burden_df_per_patient[predup_burden_df_per_patient$age > 12,]$estimated_postPGC_cell_divisions_lower) #8.240146
-median(predup_burden_df_per_patient[predup_burden_df_per_patient$age > 12,]$estimated_postPGC_cell_divisions_upper) #11.5362
 
-min(predup_burden_df_per_patient[predup_burden_df_per_patient$age > 12,]$estimated_postPGC_cell_divisions_lower) #0
-max(predup_burden_df_per_patient[predup_burden_df_per_patient$age > 12,]$estimated_postPGC_cell_divisions_upper) #35.94831
+median(predup_burden_df_per_patient[predup_burden_df_per_patient$age > 12,]$estimated_postPGC_cell_divisions) #4.806752
+range(predup_burden_df_per_patient[predup_burden_df_per_patient$age > 12,]$estimated_postPGC_cell_divisions) #0.00000 14.97846
+median(predup_burden_df_per_patient[predup_burden_df_per_patient$age > 12,]$estimated_postPGC_cell_divisions_err) #0.8011253
